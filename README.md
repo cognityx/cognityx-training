@@ -3,8 +3,9 @@
 Training backends and dataset-to-instruction-fine-tuning pipelines for Cognityx.
 
 The first vertical slice provides `CustomPyTorchTrainerBackend`, a one-step
-Transformers/PEFT LoRA or QLoRA supervised fine-tuning run. The default model is
-`Qwen/Qwen3-14B`; override `model_name` for smaller smoke tests.
+PyTorch `DataLoader`/`AdamW` loop using Transformers for Qwen loading and PEFT
+for LoRA or QLoRA adapters. The default model is `Qwen/Qwen3-14B`; override
+`model_name` for smaller smoke tests.
 
 ## Setup
 

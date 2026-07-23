@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from pathlib import Path
+import time
 from typing import Any
 
 from cognityx_core import Artifact, ModelArtifactRegistry, TrainingBackend
@@ -33,15 +34,11 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
         """
         try:
             import torch
-            from datasets import Dataset as HuggingFaceDataset
             from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
             from transformers import (
                 AutoModelForCausalLM,
                 AutoTokenizer,
                 BitsAndBytesConfig,
-                DataCollatorForLanguageModeling,
-                Trainer,
-                TrainingArguments,
             )
         except ImportError as exc:
             raise RuntimeError(
@@ -85,40 +82,62 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
 
         records = load_jsonl_records(request.dataset.uri)
         texts = render_ift_examples(records, tokenizer)
-        dataset = HuggingFaceDataset.from_dict({"text": texts})
-
-        def tokenize(batch: dict[str, list[str]]) -> dict[str, Any]:
-            return tokenizer(
-                batch["text"],
-                truncation=True,
-                max_length=self.config.max_sequence_length,
-            )
-
-        tokenized = dataset.map(tokenize, batched=True, remove_columns=["text"])
+        encoded = tokenizer(
+            texts,
+            truncation=True,
+            padding=True,
+            max_length=self.config.max_sequence_length,
+            return_tensors="pt",
+        )
+        labels = encoded["input_ids"].clone()
+        labels[encoded["attention_mask"] == 0] = -100
+        dataset = torch.utils.data.TensorDataset(
+            encoded["input_ids"],
+            encoded["attention_mask"],
+            labels,
+        )
+        loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=self.config.per_device_train_batch_size,
+            shuffle=True,
+            generator=torch.Generator().manual_seed(self.config.seed),
+        )
         output_dir = Path(self.config.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        trainer = Trainer(
-            model=model,
-            args=TrainingArguments(
-                output_dir=str(output_dir),
-                max_steps=self.config.max_steps,
-                per_device_train_batch_size=self.config.per_device_train_batch_size,
-                gradient_accumulation_steps=self.config.gradient_accumulation_steps,
-                learning_rate=self.config.learning_rate,
-                seed=self.config.seed,
-                logging_steps=1,
-                save_strategy="no",
-                report_to=[],
-                bf16=torch.cuda.is_available(),
-                fp16=False,
-                remove_unused_columns=False,
-            ),
-            train_dataset=tokenized,
-            data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False),
+        optimizer = torch.optim.AdamW(
+            (parameter for parameter in model.parameters() if parameter.requires_grad),
+            lr=self.config.learning_rate,
         )
-        train_output = trainer.train()
-        trainer.save_model(str(output_dir))
+        input_device = model.get_input_embeddings().weight.device
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        started = time.perf_counter()
+        losses: list[float] = []
+        completed_steps = 0
+        while completed_steps < self.config.max_steps:
+            for input_ids, attention_mask, batch_labels in loader:
+                outputs = model(
+                    input_ids=input_ids.to(input_device),
+                    attention_mask=attention_mask.to(input_device),
+                    labels=batch_labels.to(input_device),
+                )
+                loss = outputs.loss / self.config.gradient_accumulation_steps
+                loss.backward()
+                losses.append(float(outputs.loss.detach().cpu()))
+                if len(losses) % self.config.gradient_accumulation_steps == 0:
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    completed_steps += 1
+                    if completed_steps >= self.config.max_steps:
+                        break
+        model.save_pretrained(str(output_dir))
         tokenizer.save_pretrained(str(output_dir))
+        metrics = {
+            "train_loss": sum(losses) / len(losses),
+            "train_steps": completed_steps,
+            "train_runtime_seconds": time.perf_counter() - started,
+            "training_examples": len(dataset),
+        }
 
         artifact = Artifact(
             name=f"{request.dataset.name}-qwen-adapter",
@@ -136,4 +155,4 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
         )
         if self.artifact_registry is not None:
             artifact = self.artifact_registry.register(artifact)
-        return TrainingResult(artifact=artifact, metrics=dict(train_output.metrics))
+        return TrainingResult(artifact=artifact, metrics=metrics)
