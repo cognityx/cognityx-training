@@ -356,6 +356,7 @@ training = [
     { name = "bitsandbytes" },
     { name = "datasets" },
     { name = "peft" },
+    { name = "psutil" },
     { name = "torch" },
     { name = "transformers" },
 ]
@@ -374,6 +375,7 @@ requires-dist = [
     { name = "cognityx-core", git = "https://github.com/cognityx/cognityx-core.git" },
     { name = "datasets", marker = "extra == 'training'", specifier = ">=3.2" },
     { name = "peft", marker = "extra == 'training'", specifier = ">=0.14" },
+    { name = "psutil", marker = "extra == 'training'", specifier = ">=6.1" },
     { name = "torch", marker = "extra == 'training'", specifier = ">=2.5" },
     { name = "transformers", marker = "extra == 'training'", specifier = ">=4.51" },
 ]

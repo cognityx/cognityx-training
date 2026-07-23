@@ -20,6 +20,7 @@ def test_default_is_one_step_qwen3_14b_qlora() -> None:
         "/mnt/d/AI/models/cognityx/training/qwen-hello-world"
     )
     assert config.max_steps == 1
+    assert config.max_examples is None
     assert config.load_in_4bit is True
 
 
@@ -49,3 +50,6 @@ def test_factory_creates_custom_backend(tmp_path) -> None:
 def test_invalid_training_configuration_fails_before_loading_model() -> None:
     with pytest.raises(ValueError, match="max_steps"):
         CustomPyTorchTrainingConfig(max_steps=0).validate()
+
+    with pytest.raises(ValueError, match="max_examples"):
+        CustomPyTorchTrainingConfig(max_examples=0).validate()

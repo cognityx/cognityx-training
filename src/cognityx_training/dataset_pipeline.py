@@ -40,6 +40,44 @@ def load_jsonl_records(uri: str) -> list[dict[str, Any]]:
     return records
 
 
+def partition_records(
+    records: Iterable[dict[str, Any]],
+    max_examples: int | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Separate training and evaluation records and cap training examples.
+
+    Records with ``"split": "evaluation"`` or ``"split": "eval"`` are
+    held out. All other records train the adapter. ``max_examples`` applies
+    only to the training partition.
+    """
+    values = list(records)
+    training: list[dict[str, Any]] = []
+    evaluation: list[dict[str, Any]] = []
+    for record in values:
+        split = str(record.get("split", "train")).lower()
+        if split in {"eval", "evaluation"}:
+            evaluation.append(record)
+        else:
+            training.append(record)
+    if max_examples is not None:
+        training = training[:max_examples]
+    if not training:
+        raise ValueError("Dataset contains no training examples after filtering.")
+    return training, evaluation
+
+
+def evaluation_pair(record: dict[str, Any]) -> tuple[str, str]:
+    """Return the user prompt and expected answer for evaluation."""
+    messages = messages_for_record(record)
+    user_messages = [item["content"] for item in messages if item["role"] == "user"]
+    assistant_messages = [
+        item["content"] for item in messages if item["role"] == "assistant"
+    ]
+    if not user_messages or not assistant_messages:
+        raise ValueError("Evaluation records require user and assistant messages.")
+    return user_messages[-1], assistant_messages[-1]
+
+
 def messages_for_record(record: dict[str, Any]) -> list[dict[str, str]]:
     """Normalize either chat messages or instruction/output fields."""
     messages = record.get("messages")

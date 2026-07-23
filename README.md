@@ -45,6 +45,63 @@ uv run --extra training cognityx-train \
   --config examples/qwen3-14b-hello/config.toml
 ```
 
+Show CLI help or validate a run without loading the model:
+
+```bash
+uv run --extra training cognityx-train --help
+uv run --extra training cognityx-train \
+  --config examples/qwen3-14b-hello/config.toml --print-config --dry-run
+```
+
+Each execution stores the adapter and `training-report.json` in a unique
+`<output-dir>/<run-id>/` directory. The report includes model, dataset,
+configuration, parameter counts, CPU, RAM, disk I/O, GPU usage, step latency,
+and LoRA GPU/disk size measurements.
+
+Training workload is controlled independently with `max_examples`,
+`per_device_train_batch_size`, `gradient_accumulation_steps`, `max_steps`, and
+`max_sequence_length`. Live progress includes loss, CPU, main RAM, disk I/O,
+and GPU utilization/memory.
+
+For an evidence-based workflow, first run the one-step hello-world capacity
+baseline, then run the private-fact benefit experiment:
+
+```bash
+uv run --extra training cognityx-train \
+  --config examples/private-fact-benefit/config.toml \
+  --run-id private-fact-benefit
+```
+
+The benefit experiment compares held-out answers from the untrained base model
+and trained adapter. See [the two-phase validation guide](docs/two-phase-validation.md).
+
+## Automatic capacity search
+
+Inventory the computer and preview the search without training:
+
+```bash
+uv run --extra training cognityx-autotune \
+  --config examples/autotune-5090/config.toml --plan
+```
+
+Run isolated trials across configured axes until sustained resource policies,
+trial failure/OOM, `max_trials`, or the candidate space ends:
+
+```bash
+uv run --extra training cognityx-autotune \
+  --config examples/autotune-5090/config.toml
+```
+
+Each invocation stores configs, streamed logs, per-trial training reports, the
+hardware/software inventory, and a final `autotune-summary.json` in a unique
+session directory. See [automatic capacity tuning](docs/autotune.md).
+
+Telemetry is source- and scope-labeled so Windows-host RAM is not confused with
+WSL-VM RAM, or PyTorch allocator VRAM with whole-device `nvidia-smi` VRAM.
+Reports include GPU utilization, power, sampled energy, and temperature. Trial
+axes and candidates support economical staged searches or capped Cartesian
+grids for conditional model/sequence/batch/rank capacity comparisons.
+
 The default QLoRA path requires a CUDA GPU, enough memory for the chosen model,
 Hugging Face access, and a working BitsAndBytes installation.
 
@@ -56,3 +113,8 @@ uv run pytest
 uv run mkdocs build --strict
 uv run mkdocs serve
 ```
+
+The documentation server uses `http://127.0.0.1:8125/` to avoid the benchmark
+documentation server's port.
+
+The documentation preview is served at <http://127.0.0.1:8125/>.

@@ -25,7 +25,9 @@ class CustomPyTorchTrainingConfig(BackendConfig):
     model_cache_dir: Path = DEFAULT_HUGGING_FACE_CACHE
     local_files_only: bool = True
     output_dir: Path = Path("/mnt/d/AI/models/cognityx/training/qwen-hello-world")
+    run_id: str | None = None
     max_sequence_length: int = 512
+    max_examples: int | None = None
     max_steps: int = 1
     per_device_train_batch_size: int = 1
     gradient_accumulation_steps: int = 1
@@ -41,6 +43,12 @@ class CustomPyTorchTrainingConfig(BackendConfig):
         "v_proj",
         "o_proj",
     )
+    progress_interval_steps: int = 1
+    evaluation_max_new_tokens: int = 32
+    resource_sample_interval_seconds: float = 1.0
+    host_telemetry_source: str = "auto"
+    host_installed_memory_gib: float | None = None
+    nvidia_smi_path: str = "nvidia-smi"
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> "CustomPyTorchTrainingConfig":
@@ -66,14 +74,28 @@ class CustomPyTorchTrainingConfig(BackendConfig):
             "gradient_accumulation_steps",
             "lora_rank",
             "lora_alpha",
+            "progress_interval_steps",
+            "evaluation_max_new_tokens",
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive.")
+        if self.max_examples is not None and self.max_examples <= 0:
+            raise ValueError("max_examples must be positive when specified.")
         if self.learning_rate <= 0:
             raise ValueError("learning_rate must be positive.")
+        if self.resource_sample_interval_seconds <= 0:
+            raise ValueError("resource_sample_interval_seconds must be positive.")
+        if self.host_telemetry_source not in {"auto", "windows", "wsl"}:
+            raise ValueError("host_telemetry_source must be auto, windows, or wsl.")
+        if self.host_installed_memory_gib is not None and self.host_installed_memory_gib <= 0:
+            raise ValueError("host_installed_memory_gib must be positive.")
         if not 0 <= self.lora_dropout < 1:
             raise ValueError("lora_dropout must be between zero and one.")
         if not self.model_cache_dir.is_dir():
             raise ValueError(
                 f"Hugging Face model cache does not exist: {self.model_cache_dir}"
             )
+        if self.run_id is not None and (
+            not self.run_id or Path(self.run_id).name != self.run_id
+        ):
+            raise ValueError("run_id must be a non-empty file-name-safe value.")

@@ -1,10 +1,14 @@
 site_name: Cognityx Training
+site_description: Runnable Cognityx LoRA and QLoRA training
+dev_addr: 127.0.0.1:8125
 theme:
   name: material
 nav:
   - Home: index.md
   - Architecture: architecture.md
   - Qwen hello world: qwen-hello-world.md
+  - Capacity and benefit validation: two-phase-validation.md
+  - Automatic capacity tuning: autotune.md
   - API: api.md
 plugins:
   - search

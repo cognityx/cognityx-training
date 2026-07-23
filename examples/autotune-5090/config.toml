@@ -1,0 +1,47 @@
+[autotune]
+base_training_config = "../qwen3-14b-hello/config.toml"
+output_dir = "/mnt/d/AI/models/cognityx/training/autotune-5090"
+trial_max_steps = 2
+cooldown_seconds = 5
+
+[telemetry]
+# This WSL instance has Windows executable interop disabled, so retain a clearly
+# labeled WSL live-usage measurement and report motherboard capacity separately.
+host_source = "auto"
+installed_memory_gib = 128
+nvidia_smi_path = "nvidia-smi"
+windows_bridge_path = "/mnt/d/AI/models/cognityx/telemetry/windows-host.json"
+windows_bridge_max_age_seconds = 5
+
+[execution]
+reuse_loaded_model = true
+restart_worker_after_oom = true
+max_trials_per_worker = 25
+
+[termination]
+# Utilization is deliberately not a stop policy. Omit any policy to disable it.
+gpu_memory_percent = 99.6
+host_ram_percent = 95
+gpu_temperature_celsius = 88
+sustain_seconds = 3
+# Loading has its own clock because large model initialization can take minutes.
+model_loading_timeout_seconds = 3600
+# This clock starts only after COGNITYX_TRAINING_STARTED is emitted.
+trial_timeout_seconds = 18000
+
+[search]
+strategy = "staged"
+axes = [
+  "model_name",
+  "max_sequence_length",
+  "per_device_train_batch_size",
+  "lora_rank",
+]
+max_trials = 100
+
+[trials]
+# Add only exact model IDs that are available in the configured local cache.
+model_name = ["Qwen/Qwen3-8B", "Qwen/Qwen3-14B", "Qwen/Qwen3-32B"]
+max_sequence_length = [128, 256, 512, 1024, 2048, 4096]
+per_device_train_batch_size = [1, 2, 4, 8, 16]
+lora_rank = [8, 16, 32, 64]

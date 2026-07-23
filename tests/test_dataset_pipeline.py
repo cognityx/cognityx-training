@@ -5,6 +5,7 @@ import pytest
 from cognityx_training.dataset_pipeline import (
     load_jsonl_records,
     messages_for_record,
+    partition_records,
     render_ift_examples,
 )
 
@@ -36,3 +37,16 @@ def test_messages_are_preserved() -> None:
 def test_unsupported_dataset_provider_is_explicit() -> None:
     with pytest.raises(ValueError, match="local files only"):
         load_jsonl_records("s3://bucket/train.jsonl")
+
+
+def test_partition_caps_training_and_preserves_held_out_evaluation() -> None:
+    records = [
+        {"instruction": "train 1", "output": "one"},
+        {"instruction": "train 2", "output": "two"},
+        {"split": "evaluation", "instruction": "evaluate", "output": "answer"},
+    ]
+
+    training, evaluation = partition_records(records, max_examples=1)
+
+    assert training == records[:1]
+    assert evaluation == records[2:]

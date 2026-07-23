@@ -17,12 +17,14 @@ training = [
     "bitsandbytes>=0.45",
     "datasets>=3.2",
     "peft>=0.14",
+    "psutil>=6.1",
     "torch>=2.5",
     "transformers>=4.51",
 ]
 
 [project.scripts]
 cognityx-train = "cognityx_training.cli:main"
+cognityx-autotune = "cognityx_training.autotune:main"
 
 [dependency-groups]
 dev = [
