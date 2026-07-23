@@ -24,7 +24,7 @@ class CustomPyTorchTrainingConfig(BackendConfig):
     model_name: str = DEFAULT_MODEL
     model_cache_dir: Path = DEFAULT_HUGGING_FACE_CACHE
     local_files_only: bool = True
-    output_dir: Path = Path("outputs/qwen-hello-world")
+    output_dir: Path = Path("/mnt/d/AI/models/cognityx/training/qwen-hello-world")
     max_sequence_length: int = 512
     max_steps: int = 1
     per_device_train_batch_size: int = 1

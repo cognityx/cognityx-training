@@ -17,6 +17,12 @@ WSL: /mnt/d/AI/models/huggingface/hub
 `local_files_only = true` prevents an accidental duplicate download. Change it
 explicitly only when you intend to add a model to that cache.
 
+Trained adapters are also written under `D:\AI\models`, using:
+
+```text
+/mnt/d/AI/models/cognityx/training/
+```
+
 ## Setup
 
 ```bash

@@ -16,6 +16,9 @@ def test_default_is_one_step_qwen3_14b_qlora() -> None:
     assert config.model_name == "Qwen/Qwen3-14B"
     assert config.model_cache_dir == Path("/mnt/d/AI/models/huggingface/hub")
     assert config.local_files_only is True
+    assert config.output_dir == Path(
+        "/mnt/d/AI/models/cognityx/training/qwen-hello-world"
+    )
     assert config.max_steps == 1
     assert config.load_in_4bit is True
 

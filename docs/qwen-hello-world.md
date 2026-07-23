@@ -15,6 +15,8 @@ adapters on Qwen attention projections.
 It explicitly uses `/mnt/d/AI/models/huggingface/hub`, corresponding to
 `D:\AI\models\huggingface\hub`, and enables `local_files_only`. This reuses the
 existing Qwen snapshot and fails clearly instead of downloading a second copy.
+The generated LoRA adapter is saved under
+`/mnt/d/AI/models/cognityx/training/qwen3-14b-hello`.
 
 For a lower-cost smoke test, copy the TOML and change `model_name` to a smaller
 Qwen causal language model. The dataset pipeline accepts either a `messages`
