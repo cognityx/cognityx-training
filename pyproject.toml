@@ -1,0 +1,39 @@
+[project]
+name = "cognityx-training"
+version = "0.1.0"
+description = "Training backends and dataset pipelines for Cognityx"
+readme = "README.md"
+authors = [
+    { name = "Bhujay Kumar Bhatta", email = "bhujay.bhatta@yahoo.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "cognityx-core",
+]
+
+[project.optional-dependencies]
+training = [
+    "accelerate>=1.2",
+    "bitsandbytes>=0.45",
+    "datasets>=3.2",
+    "peft>=0.14",
+    "torch>=2.5",
+    "transformers>=4.51",
+]
+
+[project.scripts]
+cognityx-train = "cognityx_training.cli:main"
+
+[dependency-groups]
+dev = [
+    "mkdocs-material>=9.5",
+    "mkdocstrings-python>=1.12",
+    "pytest>=8.0",
+]
+
+[tool.uv.sources]
+cognityx-core = { git = "https://github.com/cognityx/cognityx-core.git" }
+
+[build-system]
+requires = ["uv_build>=0.11.29,<0.12.0"]
+build-backend = "uv_build"
