@@ -1,12 +1,19 @@
 """Typed configuration for the custom PyTorch training backend."""
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Any, Mapping
 
 from cognityx_core import BackendConfig
 
 DEFAULT_MODEL = "Qwen/Qwen3-14B"
+DEFAULT_HUGGING_FACE_HOME = Path(
+    os.environ.get("HF_HOME", "/mnt/d/AI/models/huggingface")
+)
+DEFAULT_HUGGING_FACE_CACHE = Path(
+    os.environ.get("HF_HUB_CACHE", DEFAULT_HUGGING_FACE_HOME / "hub")
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,6 +22,8 @@ class CustomPyTorchTrainingConfig(BackendConfig):
 
     backend: str = "custom-pytorch"
     model_name: str = DEFAULT_MODEL
+    model_cache_dir: Path = DEFAULT_HUGGING_FACE_CACHE
+    local_files_only: bool = True
     output_dir: Path = Path("outputs/qwen-hello-world")
     max_sequence_length: int = 512
     max_steps: int = 1
@@ -37,8 +46,9 @@ class CustomPyTorchTrainingConfig(BackendConfig):
     def from_mapping(cls, values: Mapping[str, Any]) -> "CustomPyTorchTrainingConfig":
         """Build validated configuration from a TOML-compatible mapping."""
         normalized = dict(values)
-        if "output_dir" in normalized:
-            normalized["output_dir"] = Path(normalized["output_dir"])
+        for path_field in ("model_cache_dir", "output_dir"):
+            if path_field in normalized:
+                normalized[path_field] = Path(normalized[path_field])
         if "target_modules" in normalized:
             normalized["target_modules"] = tuple(normalized["target_modules"])
         config = cls(**normalized)
@@ -63,3 +73,7 @@ class CustomPyTorchTrainingConfig(BackendConfig):
             raise ValueError("learning_rate must be positive.")
         if not 0 <= self.lora_dropout < 1:
             raise ValueError("lora_dropout must be between zero and one.")
+        if not self.model_cache_dir.is_dir():
+            raise ValueError(
+                f"Hugging Face model cache does not exist: {self.model_cache_dir}"
+            )

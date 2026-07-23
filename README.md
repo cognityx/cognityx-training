@@ -7,10 +7,26 @@ PyTorch `DataLoader`/`AdamW` loop using Transformers for Qwen loading and PEFT
 for LoRA or QLoRA adapters. The default model is `Qwen/Qwen3-14B`; override
 `model_name` for smaller smoke tests.
 
+The checked-in example loads models only from the existing Windows cache:
+
+```text
+D:\AI\models\huggingface\hub
+WSL: /mnt/d/AI/models/huggingface/hub
+```
+
+`local_files_only = true` prevents an accidental duplicate download. Change it
+explicitly only when you intend to add a model to that cache.
+
 ## Setup
 
 ```bash
 uv sync --extra training
+```
+
+For Hugging Face tools outside this application, select the same cache root:
+
+```bash
+export HF_HOME=/mnt/d/AI/models/huggingface
 ```
 
 `cognityx-core` is resolved as a normal private Git dependency. No Git

@@ -14,21 +14,30 @@ def test_default_is_one_step_qwen3_14b_qlora() -> None:
     config = CustomPyTorchTrainingConfig()
 
     assert config.model_name == "Qwen/Qwen3-14B"
+    assert config.model_cache_dir == Path("/mnt/d/AI/models/huggingface/hub")
+    assert config.local_files_only is True
     assert config.max_steps == 1
     assert config.load_in_4bit is True
 
 
-def test_mapping_normalizes_backend_specific_values() -> None:
+def test_mapping_normalizes_backend_specific_values(tmp_path) -> None:
     config = CustomPyTorchTrainingConfig.from_mapping(
-        {"output_dir": "tmp/output", "target_modules": ["q_proj", "v_proj"]}
+        {
+            "model_cache_dir": str(tmp_path),
+            "output_dir": "tmp/output",
+            "target_modules": ["q_proj", "v_proj"],
+        }
     )
 
+    assert config.model_cache_dir == tmp_path
     assert config.output_dir == Path("tmp/output")
     assert config.target_modules == ("q_proj", "v_proj")
 
 
-def test_factory_creates_custom_backend() -> None:
-    backend = create_training_backend(CustomPyTorchTrainingConfig())
+def test_factory_creates_custom_backend(tmp_path) -> None:
+    backend = create_training_backend(
+        CustomPyTorchTrainingConfig(model_cache_dir=tmp_path)
+    )
 
     assert isinstance(backend, TrainingBackend)
     assert isinstance(backend, CustomPyTorchTrainerBackend)

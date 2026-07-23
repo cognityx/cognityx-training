@@ -1,6 +1,8 @@
 [training]
 backend = "custom-pytorch"
 model_name = "Qwen/Qwen3-14B"
+model_cache_dir = "/mnt/d/AI/models/huggingface/hub"
+local_files_only = true
 output_dir = "outputs/qwen3-14b-hello"
 max_sequence_length = 512
 max_steps = 1

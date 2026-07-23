@@ -45,7 +45,14 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
                 "Training dependencies are missing. Run `uv sync --extra training`."
             ) from exc
 
-        tokenizer = AutoTokenizer.from_pretrained(self.config.model_name)
+        model_source_options = {
+            "cache_dir": str(self.config.model_cache_dir),
+            "local_files_only": self.config.local_files_only,
+        }
+        tokenizer = AutoTokenizer.from_pretrained(
+            self.config.model_name,
+            **model_source_options,
+        )
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
 
@@ -65,6 +72,7 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
 
         model = AutoModelForCausalLM.from_pretrained(
             self.config.model_name,
+            **model_source_options,
             **model_kwargs,
         )
         if self.config.load_in_4bit:
@@ -145,6 +153,8 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
             uri=output_dir.resolve().as_uri(),
             metadata={
                 "base_model": self.config.model_name,
+                "model_cache_dir": str(self.config.model_cache_dir),
+                "local_files_only": self.config.local_files_only,
                 "backend": self.config.backend,
                 "qlora": self.config.load_in_4bit,
                 "configuration": {
