@@ -87,10 +87,99 @@ def test_windows_bridge_accepts_fresh_sample_and_rejects_stale(tmp_path) -> None
 
 
 def test_windows_collector_uses_64_bit_safe_gpu_counter_conversion() -> None:
-    script = Path("scripts/windows-gpu-telemetry.ps1").read_text(encoding="utf-8")
+    script = Path(
+        "src/cognityx_training/windows-gpu-telemetry.ps1"
+    ).read_text(encoding="utf-8")
 
     assert "ConvertTo-NonnegativeInt64" in script
     assert "[Math]::Max([double]0, [double]$Value)" in script
     assert "[Math]::Max(0, $dedicatedUsed)" not in script
     # The reported failure is greater than Int32.MaxValue but valid as Int64.
     assert 33_497_915_392 > 2_147_483_647
+
+
+def test_managed_windows_producer_starts_waits_and_stops_owned_process(
+    tmp_path, monkeypatch
+) -> None:
+    script_path = tmp_path / "collector.ps1"
+    script_path.write_text("# test", encoding="utf-8")
+    output_path = tmp_path / "session" / "windows-host.json"
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.terminated = False
+
+        def poll(self):
+            return None
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def wait(self, timeout=None) -> int:
+            return 0
+
+    process = FakeProcess()
+    commands = []
+    monkeypatch.setattr(telemetry.Path, "exists", lambda _path: True)
+    monkeypatch.setattr(
+        telemetry.WindowsTelemetryProducer,
+        "_windows_path",
+        staticmethod(lambda path: f"WIN:{path}"),
+    )
+    monkeypatch.setattr(
+        telemetry.subprocess,
+        "Popen",
+        lambda command, **kwargs: commands.append(command) or process,
+    )
+    monkeypatch.setattr(
+        telemetry,
+        "query_windows_bridge",
+        lambda path, max_age: {"shared_used_bytes": 1},
+    )
+    producer = telemetry.WindowsTelemetryProducer(script_path, output_path)
+
+    sample = producer.start()
+    producer.stop()
+
+    assert sample["shared_used_bytes"] == 1
+    assert "-ExecutionPolicy" in commands[0]
+    assert "Bypass" in commands[0]
+    assert f"WIN:{output_path}" in commands[0]
+    assert process.terminated is True
+    assert producer.process is None
+
+
+def test_managed_windows_producer_cleans_up_after_startup_failure(
+    tmp_path, monkeypatch
+) -> None:
+    script_path = tmp_path / "collector.ps1"
+    script_path.write_text("# test", encoding="utf-8")
+    output_path = tmp_path / "windows-host.json"
+
+    class FailedProcess:
+        def poll(self):
+            return 1
+
+    monkeypatch.setattr(telemetry.Path, "exists", lambda _path: True)
+    monkeypatch.setattr(
+        telemetry.WindowsTelemetryProducer,
+        "_windows_path",
+        staticmethod(lambda path: str(path)),
+    )
+    monkeypatch.setattr(
+        telemetry.subprocess, "Popen", lambda *args, **kwargs: FailedProcess()
+    )
+    monkeypatch.setattr(
+        telemetry, "query_windows_bridge", lambda path, max_age: None
+    )
+    producer = telemetry.WindowsTelemetryProducer(script_path, output_path)
+
+    try:
+        producer.start()
+    except RuntimeError as exc:
+        assert "exited during startup" in str(exc)
+    else:
+        raise AssertionError("failed telemetry producer was accepted")
+
+    assert producer.process is None
+    assert producer._log is None

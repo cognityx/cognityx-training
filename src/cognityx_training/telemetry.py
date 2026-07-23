@@ -6,7 +6,119 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
+import time
 from typing import Any
+
+
+class WindowsTelemetryProducer:
+    """Own a Windows telemetry collector started for one autotune session."""
+
+    def __init__(
+        self,
+        script_path: Path,
+        output_path: Path,
+        interval_seconds: float = 1.0,
+        startup_timeout_seconds: float = 20.0,
+        max_age_seconds: float = 5.0,
+    ) -> None:
+        self.script_path = script_path
+        self.output_path = output_path
+        self.interval_seconds = interval_seconds
+        self.startup_timeout_seconds = startup_timeout_seconds
+        self.max_age_seconds = max_age_seconds
+        self.process: subprocess.Popen[str] | None = None
+        self._log = None
+        self.log_path = output_path.with_suffix(".producer.log")
+
+    @staticmethod
+    def _windows_path(path: Path) -> str:
+        result = subprocess.run(
+            ["wslpath", "-w", str(path.resolve())],
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=10,
+        )
+        return result.stdout.strip()
+
+    def start(self) -> dict[str, Any]:
+        """Start the collector and wait until it writes a fresh valid sample."""
+        powershell = Path(
+            "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+        )
+        if not powershell.exists():
+            raise RuntimeError(
+                "Cannot start managed Windows GPU telemetry: powershell.exe "
+                "is unavailable from WSL."
+            )
+        if not self.script_path.exists():
+            raise RuntimeError(
+                f"Windows GPU telemetry script not found: {self.script_path}"
+            )
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._log = self.log_path.open("w", encoding="utf-8")
+        command = [
+            str(powershell),
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            self._windows_path(self.script_path),
+            "-OutputPath",
+            self._windows_path(self.output_path),
+            "-IntervalSeconds",
+            str(self.interval_seconds),
+        ]
+        try:
+            self.process = subprocess.Popen(
+                command,
+                stdout=self._log,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            deadline = time.monotonic() + self.startup_timeout_seconds
+            while time.monotonic() < deadline:
+                sample = query_windows_bridge(
+                    self.output_path, self.max_age_seconds
+                )
+                if sample is not None:
+                    return sample
+                if self.process.poll() is not None:
+                    raise RuntimeError(
+                        "Managed Windows GPU telemetry exited during startup. "
+                        f"See {self.log_path}."
+                    )
+                time.sleep(min(0.2, self.interval_seconds))
+            raise RuntimeError(
+                "Managed Windows GPU telemetry did not produce a fresh sample "
+                f"within {self.startup_timeout_seconds:g}s. See {self.log_path}."
+            )
+        except BaseException:
+            self.stop()
+            raise
+
+    def stop(self) -> None:
+        """Stop only the collector process owned by this instance."""
+        process = self.process
+        self.process = None
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        if self._log is not None:
+            self._log.close()
+            self._log = None
+
+    def __enter__(self) -> "WindowsTelemetryProducer":
+        self.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.stop()
 
 
 def query_windows_host() -> dict[str, Any] | None:

@@ -21,6 +21,8 @@ from cognityx_training.autotune import (
     _LoadingProcessSampler,
     _SingleLineStatusDisplay,
     run_autotune,
+    _format_loading_status,
+    _is_immediate_timeout_key,
 )
 import cognityx_training.autotune as autotune_module
 
@@ -150,6 +152,8 @@ def test_no_step_progress_timeout_is_optional_and_independent() -> None:
     assert [breach[0] for breach in breaches] == [
         "no_step_progress_timeout_seconds"
     ]
+    assert _is_immediate_timeout_key("no_step_progress_timeout_seconds")
+    assert not _is_immediate_timeout_key("gpu_memory_percent")
 
 
 def test_capacity_frontier_reports_maximum_success_per_model() -> None:
@@ -177,6 +181,90 @@ def test_example_enables_bounded_model_reuse() -> None:
     assert config.reuse_loaded_model is True
     assert config.restart_worker_after_oom is True
     assert config.max_trials_per_worker == 25
+    assert config.manage_windows_bridge is True
+    assert config.windows_bridge_interval_seconds == 1
+    assert config.windows_bridge_startup_timeout_seconds == 20
+
+
+def test_run_autotune_stops_managed_telemetry_after_failure(
+    tmp_path, monkeypatch
+) -> None:
+    controller = AutotuneConfig(
+        base_training_config=tmp_path / "base.toml",
+        output_dir=tmp_path / "outputs",
+        manage_windows_bridge=True,
+        candidates={"model_name": ("model-a",)},
+        axes=("model_name",),
+    )
+    events = []
+
+    class FakeProducer:
+        def __init__(self, **kwargs) -> None:
+            events.append(("created", kwargs["output_path"]))
+
+        def start(self) -> None:
+            events.append(("started", None))
+
+        def stop(self) -> None:
+            events.append(("stopped", None))
+
+    monkeypatch.setattr(
+        autotune_module,
+        "load_autotune_config",
+        lambda path: (controller, {"training": {}}),
+    )
+    monkeypatch.setattr(
+        autotune_module, "WindowsTelemetryProducer", FakeProducer
+    )
+    monkeypatch.setattr(
+        autotune_module,
+        "_run_autotune",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("trial failed")),
+    )
+
+    try:
+        run_autotune(tmp_path / "autotune.toml")
+    except RuntimeError as exc:
+        assert str(exc) == "trial failed"
+    else:
+        raise AssertionError("autotune failure was swallowed")
+
+    assert [event[0] for event in events] == ["created", "started", "stopped"]
+    assert "sessions" in events[0][1].parts
+    assert events[0][1].name == "windows-host.json"
+
+
+def test_plan_mode_does_not_start_managed_windows_telemetry(
+    tmp_path, monkeypatch
+) -> None:
+    controller = AutotuneConfig(
+        base_training_config=tmp_path / "base.toml",
+        output_dir=tmp_path / "outputs",
+        manage_windows_bridge=True,
+        candidates={"model_name": ("model-a",)},
+        axes=("model_name",),
+    )
+    monkeypatch.setattr(
+        autotune_module,
+        "load_autotune_config",
+        lambda path: (controller, {"training": {}}),
+    )
+    monkeypatch.setattr(
+        autotune_module,
+        "WindowsTelemetryProducer",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("producer started in plan mode")
+        ),
+    )
+    monkeypatch.setattr(
+        autotune_module,
+        "_run_autotune",
+        lambda received, values, plan_only: {"plan_only": plan_only},
+    )
+
+    result = run_autotune(tmp_path / "autotune.toml", plan_only=True)
+
+    assert result == {"plan_only": True}
 
 
 def test_switching_models_discards_the_previous_worker(monkeypatch) -> None:
@@ -206,6 +294,24 @@ def test_loading_rate_does_not_report_negative_or_divide_by_zero() -> None:
     assert _rate(300, 100, 2) == 100
     assert _rate(100, 300, 2) == 0
     assert _rate(200, 100, 0) > 0
+
+
+def test_loading_status_prioritizes_vram_and_gpu_health() -> None:
+    status = _format_loading_status(
+        19,
+        "VRAM 7.7G +0M/s(est) | GPU 17% 45W 52C",
+        "WinGPU shared unavailable",
+        "modelFS /mnt/d 9p | read 0M/s",
+        "procCPU 31% wsl_vmCPU 6%",
+        "RAM(wsl_vm) 4.5/62.7G",
+    )
+
+    assert status.startswith(
+        "LOAD     19s | VRAM 7.7G +0M/s(est) | GPU 17% 45W 52C"
+    )
+    assert status.index("VRAM") < status.index("WinGPU")
+    assert status.index("GPU 17%") < status.index("modelFS")
+    assert status.index("modelFS") < status.index("procCPU")
 
 
 def test_two_line_loading_display_updates_in_place_on_tty() -> None:
@@ -479,3 +585,73 @@ def test_grid_search_is_model_major_even_when_model_axis_is_not_first(
 
     models = [trial["configuration"]["model_name"] for trial in summary["trials"]]
     assert models == ["model-8B"] * 4 + ["model-14B"] * 4
+
+
+def test_staged_step_timeout_prunes_higher_axis_and_uses_last_safe_for_next_axis(
+    tmp_path, monkeypatch
+) -> None:
+    config_path = _write_scheduler_config(
+        tmp_path,
+        "staged",
+        [
+            "model_name",
+            "max_sequence_length",
+            "per_device_train_batch_size",
+            "lora_rank",
+        ],
+    )
+    text = config_path.read_text(encoding="utf-8").replace(
+        "per_device_train_batch_size = [1, 2]",
+        "per_device_train_batch_size = [1, 2, 4, 8]",
+    )
+    config_path.write_text(text + "\nlora_rank = [8, 16]\n", encoding="utf-8")
+    _mock_scheduler_runtime(monkeypatch)
+    seen: dict[str, int] = {}
+
+    def timed_trial(trial_id, stage, config, controller, dataset_path):
+        count = seen.get(config.model_name, 0)
+        seen[config.model_name] = count + 1
+        timed_out = (
+            stage == "per_device_train_batch_size"
+            and config.per_device_train_batch_size == 2
+        )
+        return {
+            "trial_id": trial_id,
+            "stage": stage,
+            "status": "timeout" if timed_out else "completed",
+            "timeout_type": "no_step_progress" if timed_out else None,
+            "runtime_seconds": 1.0,
+            "model_weights_reused": count > 0,
+            "configuration": {
+                "model_name": config.model_name,
+                "max_sequence_length": config.max_sequence_length,
+                "per_device_train_batch_size": config.per_device_train_batch_size,
+                "lora_rank": config.lora_rank,
+            },
+            "gpu_memory_peak_percent": 50.0,
+            "system_ram_peak_percent": 20.0,
+        }
+
+    monkeypatch.setattr(autotune_module, "_run_trial", timed_trial)
+
+    summary = run_autotune(config_path)
+
+    model_trials = [
+        trial
+        for trial in summary["trials"]
+        if trial["configuration"]["model_name"] == "model-8B"
+    ]
+    batch_trials = [
+        trial
+        for trial in model_trials
+        if trial["stage"] == "per_device_train_batch_size"
+    ]
+    rank_trials = [trial for trial in model_trials if trial["stage"] == "lora_rank"]
+    assert [trial["configuration"]["per_device_train_batch_size"] for trial in batch_trials] == [2]
+    assert rank_trials[-1]["configuration"]["per_device_train_batch_size"] == 1
+    assert {
+        item["candidate"]
+        for item in summary["pruned_candidates"]
+        if item["model_name"] == "model-8B"
+        and item["axis"] == "per_device_train_batch_size"
+    } == {4, 8}

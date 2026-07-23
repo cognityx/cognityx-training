@@ -29,33 +29,36 @@ scopes match. GPU memory can also fall immediately after a child process exits.
 The RTX 5090 example uses `host_source = "auto"` plus
 `installed_memory_gib = 128`. When Windows interop works, terminal progress can
 show `windows_host RAM 65.0/128.0 GiB`. In this workspace Windows executable
-interop is disabled, so live usage is explicitly labeled
-`wsl_vm ... (wsl_memory_limit)` and motherboard capacity is reported separately
-as configured 128 GiB. The 95% RAM termination policy then applies to the WSL
-limit, not unobservable total Windows usage; the program does not fabricate a
+interop may be unavailable temporarily; in that case live usage is explicitly
+labeled `wsl_vm ... (wsl_memory_limit)` and motherboard capacity is reported
+separately as configured 128 GiB. The program does not fabricate a
 Windows-used value.
 
 ### Windows shared GPU memory bridge
 
 Windows Task Manager's combined GPU memory is dedicated VRAM plus host-backed
 shared GPU memory. `nvidia-smi` exposes dedicated VRAM but not the Windows shared
-counter through this WSL setup. Before starting autotune, open a separate
-**Windows PowerShell** window and run:
+counter through this WSL setup. The RTX 5090 configuration enables a managed
+Windows telemetry producer:
 
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-& "\\wsl.localhost\Ubuntu-24.04\home\bhujay\ai-workspace\cognityx-training\scripts\windows-gpu-telemetry.ps1"
+```toml
+[telemetry]
+manage_windows_bridge = true
+windows_bridge_interval_seconds = 1
+windows_bridge_startup_timeout_seconds = 20
+windows_bridge_max_age_seconds = 5
 ```
 
-Keep that collector running. It writes one atomic JSON sample per second to:
+`cognityx-autotune` launches PowerShell itself, waits for a fresh sample before
+loading any model, and writes telemetry into the current session directory.
+The controller retains the child-process handle and stops only that producer
+when autotune completes, fails, times out, or is interrupted. `--plan` does not
+start the producer.
 
-```text
-D:\AI\models\cognityx\telemetry\windows-host.json
-```
-
-The checked-in autotune configuration reads the same file as
-`/mnt/d/AI/models/cognityx/telemetry/windows-host.json` and rejects samples older
-than five seconds. Loading and training rows prioritize:
+For compatibility with an externally managed collector, set
+`manage_windows_bridge = false` and configure `windows_bridge_path`. Samples
+older than `windows_bridge_max_age_seconds` are rejected. Loading and training
+rows prioritize:
 
 ```text
 WinGPU D31.1/31.5G S45.5/64.0G C76.6/95.5G S+820M/s
@@ -142,6 +145,15 @@ While a fresh model is loading, the telemetry row shows:
 - whole-device VRAM and its positive growth rate;
 - GPU utilization, power draw, and temperature.
 
+The bounded row orders whole-device VRAM growth, GPU utilization, power, and
+temperature immediately after elapsed time. Windows shared/combined memory,
+model-storage, CPU, and RAM follow. This keeps GPU health visible even when a
+narrow terminal clips the end of the row:
+
+```text
+LOAD 19s | VRAM 7.7G +0M/s(est) | GPU 17% 45W 52C | WinGPU ... | modelFS ...
+```
+
 `VRAM growth` is an estimate of how quickly GPU memory is being populated, not
 an exact PCIe host-to-device bandwidth measurement. Exact transfer bandwidth
 requires a CUDA/CUPTI or Nsight trace. The program no longer substitutes
@@ -197,9 +209,8 @@ host_ram_percent = 95
 gpu_temperature_celsius = 88
 sustain_seconds = 3
 model_loading_timeout_seconds = 3600
-trial_timeout_seconds = 900
-# Optional and disabled when omitted:
-# no_step_progress_timeout_seconds = 1800
+trial_timeout_seconds = 3600
+no_step_progress_timeout_seconds = 900
 ```
 
 The two timeouts use separate clocks. `model_loading_timeout_seconds` covers
@@ -210,10 +221,19 @@ evaluation are outside both clocks. The summary records `model_loading_seconds`,
 `training_seconds`, and total `runtime_seconds` separately. Omit either timeout
 to disable it.
 
-`no_step_progress_timeout_seconds` is a third, optional clock that resets after
-every completed optimizer step. It can stop a worker that remains inside one
-step for too long, but it is intentionally absent from the checked-in example:
-a slow, fully utilized GPU is not automatically considered unhealthy.
+`no_step_progress_timeout_seconds` is a third clock that resets after every
+completed optimizer step. The checked-in RTX 5090 example terminates a trial
+when one step reaches 900 seconds. Time deadlines are enforced immediately on
+the next approximately one-second controller sample; the three-second
+`sustain_seconds` window applies only to fluctuating resource measurements.
+
+A no-step timeout establishes an ordered boundary for the active staged axis.
+For example, if batch 4 times out, batch 8 and 16 are recorded in
+`pruned_candidates` and are not executed. The next axis continues from the last
+safe batch. If the minimum model configuration times out, all remaining axes
+for that model are pruned. Grid pruning is context-specific and skips only
+equal-or-higher values on the active grid axis when all other configuration
+values match.
 
 Optional `gpu_power_watts` and `gpu_power_percent_of_limit` policies are also
 supported. Omit a policy to disable it. Reaching the GPU's normal power limit
@@ -224,8 +244,9 @@ The checked-in RTX 5090 example stops when any configured policy remains
 breached for three seconds, when the child fails/OOMs, or when the candidate
 space is exhausted:
 
-- whole-device GPU memory reaches 98% of physical VRAM;
+- whole-device GPU memory reaches the configured percentage of physical VRAM;
 - labeled Windows-host or WSL-VM RAM reaches 95%;
+- one optimizer step reaches 900 seconds without completion;
 - the child exits unsuccessfully, including CUDA out-of-memory;
 - all configured candidates complete below the thresholds.
 

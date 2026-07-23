@@ -10,7 +10,9 @@ cooldown_seconds = 5
 host_source = "auto"
 installed_memory_gib = 128
 nvidia_smi_path = "nvidia-smi"
-windows_bridge_path = "/mnt/d/AI/models/cognityx/telemetry/windows-host.json"
+manage_windows_bridge = true
+windows_bridge_interval_seconds = 1
+windows_bridge_startup_timeout_seconds = 20
 windows_bridge_max_age_seconds = 5
 
 [execution]
@@ -20,14 +22,15 @@ max_trials_per_worker = 25
 
 [termination]
 # Utilization is deliberately not a stop policy. Omit any policy to disable it.
-gpu_memory_percent = 99.6
+gpu_memory_percent = 99
 host_ram_percent = 95
 gpu_temperature_celsius = 88
 sustain_seconds = 3
 # Loading has its own clock because large model initialization can take minutes.
 model_loading_timeout_seconds = 3600
 # This clock starts only after COGNITYX_TRAINING_STARTED is emitted.
-trial_timeout_seconds = 18000
+trial_timeout_seconds = 3600
+no_step_progress_timeout_seconds = 900
 
 [search]
 strategy = "staged"

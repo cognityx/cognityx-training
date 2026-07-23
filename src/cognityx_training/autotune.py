@@ -28,6 +28,7 @@ import uuid
 
 from cognityx_training.configuration import CustomPyTorchTrainingConfig
 from cognityx_training.telemetry import (
+    WindowsTelemetryProducer,
     query_host,
     query_nvidia_gpus,
     query_windows_bridge,
@@ -68,6 +69,9 @@ class AutotuneConfig:
     host_installed_memory_gib: float | None = None
     windows_bridge_path: Path | None = None
     windows_bridge_max_age_seconds: float = 5.0
+    manage_windows_bridge: bool = False
+    windows_bridge_interval_seconds: float = 1.0
+    windows_bridge_startup_timeout_seconds: float = 20.0
     nvidia_smi_path: str = "nvidia-smi"
     reuse_loaded_model: bool = False
     restart_worker_after_oom: bool = True
@@ -92,6 +96,12 @@ class AutotuneConfig:
             raise ValueError("max_trials_per_worker must be positive.")
         if self.windows_bridge_max_age_seconds <= 0:
             raise ValueError("windows_bridge_max_age_seconds must be positive.")
+        if self.windows_bridge_interval_seconds <= 0:
+            raise ValueError("windows_bridge_interval_seconds must be positive.")
+        if self.windows_bridge_startup_timeout_seconds <= 0:
+            raise ValueError(
+                "windows_bridge_startup_timeout_seconds must be positive."
+            )
         if self.reuse_loaded_model and not self.restart_worker_after_oom:
             raise ValueError(
                 "restart_worker_after_oom must remain true when model reuse is enabled; "
@@ -241,6 +251,15 @@ def load_autotune_config(path: Path) -> tuple[AutotuneConfig, dict[str, Any]]:
         ),
         windows_bridge_max_age_seconds=float(
             telemetry.get("windows_bridge_max_age_seconds", 5)
+        ),
+        manage_windows_bridge=bool(
+            telemetry.get("manage_windows_bridge", False)
+        ),
+        windows_bridge_interval_seconds=float(
+            telemetry.get("windows_bridge_interval_seconds", 1)
+        ),
+        windows_bridge_startup_timeout_seconds=float(
+            telemetry.get("windows_bridge_startup_timeout_seconds", 20)
         ),
         nvidia_smi_path=str(telemetry.get("nvidia_smi_path", "nvidia-smi")),
         reuse_loaded_model=bool(execution.get("reuse_loaded_model", False)),
@@ -531,6 +550,27 @@ def _rate(current: float, previous: float, seconds: float) -> float:
     return max(0.0, current - previous) / max(seconds, 1e-9)
 
 
+def _format_loading_status(
+    elapsed_seconds: float,
+    gpu_status: str,
+    windows_gpu_status: str,
+    storage_status: str,
+    cpu_status: str,
+    ram_status: str,
+) -> str:
+    """Order bounded loading telemetry by operational importance."""
+    return " | ".join(
+        (
+            f"LOAD {elapsed_seconds:6.0f}s",
+            gpu_status,
+            windows_gpu_status,
+            storage_status,
+            cpu_status,
+            ram_status,
+        )
+    )
+
+
 class _TwoLineLoadingDisplay:
     """Keep library progress and Cognityx telemetry on two stable TTY rows."""
 
@@ -720,6 +760,19 @@ def _policy_breaches(
             )
         )
     return breaches
+
+
+_IMMEDIATE_TIMEOUT_KEYS = frozenset(
+    {
+        "model_loading_timeout_seconds",
+        "trial_timeout_seconds",
+        "no_step_progress_timeout_seconds",
+    }
+)
+
+
+def _is_immediate_timeout_key(key: str) -> bool:
+    return key in _IMMEDIATE_TIMEOUT_KEYS
 
 
 def _stop_process_group(process: subprocess.Popen[Any]) -> None:
@@ -935,6 +988,7 @@ def _run_trial(
     live_host_source: str | None = None
     live_host_scope: str | None = None
     live_threshold_reason: str | None = None
+    live_threshold_key: str | None = None
     breach_since: dict[str, float] = {}
     next_capacity_check = 0.0
     trial_finished = False
@@ -1207,28 +1261,37 @@ def _run_trial(
                             if windows is not None
                             else "WinGPU shared unavailable | "
                         )
-                        loading_line = (
-                            f"LOAD {time.perf_counter() - started:6.0f}s | "
-                            + windows_memory_text
-                            + f"modelFS {model_storage['mount_point'] or '?'} "
-                            f"{model_storage['filesystem_type']} | "
-                            f"read {physical_rate / mib:5.0f}M/s "
-                            f"{read_operations_rate:4.0f}op/s | "
-                            f"procCPU {process_sample['process_cpu_percent']:4.0f}% "
-                            f"{host['scope']}CPU {host['cpu_percent']:3.0f}% | "
-                            f"procRAM {process_sample['rss_bytes'] / gib:4.1f}G | "
-                            f"RAM({host['scope']}) {host['used_bytes'] / gib:4.1f}/"
-                            f"{host['total_bytes'] / gib:4.1f}G"
-                            + (
-                                f" installed {host['installed_physical_total_bytes'] / gib:.0f}G"
-                                if host.get("installed_physical_total_bytes")
-                                else ""
-                            )
-                            + " | "
-                            + f"VRAM {gpu_used_bytes / gib:4.1f}G "
-                            f"+{vram_growth_rate / mib:5.0f}M/s(est) | "
-                            f"{utilization or 0:3.0f}% {total_power:5.0f}W "
-                            f"{temperature or 0:3.0f}C"
+                        loading_line = _format_loading_status(
+                            time.perf_counter() - started,
+                            (
+                                f"VRAM {gpu_used_bytes / gib:4.1f}G "
+                                f"+{vram_growth_rate / mib:5.0f}M/s(est) | "
+                                f"GPU {utilization or 0:3.0f}% "
+                                f"{total_power:5.0f}W {temperature or 0:3.0f}C"
+                            ),
+                            windows_memory_text.rstrip(" | "),
+                            (
+                                f"modelFS {model_storage['mount_point'] or '?'} "
+                                f"{model_storage['filesystem_type']} | "
+                                f"read {physical_rate / mib:5.0f}M/s "
+                                f"{read_operations_rate:4.0f}op/s"
+                            ),
+                            (
+                                f"procCPU {process_sample['process_cpu_percent']:4.0f}% "
+                                f"{host['scope']}CPU {host['cpu_percent']:3.0f}%"
+                            ),
+                            (
+                                f"procRAM {process_sample['rss_bytes'] / gib:4.1f}G | "
+                                f"RAM({host['scope']}) "
+                                f"{host['used_bytes'] / gib:4.1f}/"
+                                f"{host['total_bytes'] / gib:4.1f}G"
+                                + (
+                                    " installed "
+                                    f"{host['installed_physical_total_bytes'] / gib:.0f}G"
+                                    if host.get("installed_physical_total_bytes")
+                                    else ""
+                                )
+                            ),
                         )
                         loading_display.update_stats(loading_line)
                         previous_loading_sample = process_sample
@@ -1284,8 +1347,15 @@ def _run_trial(
                     if key not in active_keys:
                         del breach_since[key]
                 for key, value, limit, label in breaches:
+                    if _is_immediate_timeout_key(key):
+                        live_threshold_key = key
+                        live_threshold_reason = (
+                            f"{label} {value:.1f} reached {limit:.1f}"
+                        )
+                        break
                     breach_since.setdefault(key, now)
                     if now - breach_since[key] >= controller.termination_sustain_seconds:
+                        live_threshold_key = key
                         live_threshold_reason = (
                             f"{label} {value:.1f} reached {limit:.1f} for "
                             f"{controller.termination_sustain_seconds:.1f}s"
@@ -1353,7 +1423,12 @@ def _run_trial(
     ram_peak = max(ram_peak or 0.0, live_ram_peak)
     status = "completed" if return_code == 0 and report is not None else "failed"
     if live_threshold_reason:
-        status = "threshold_reached"
+        status = (
+            "timeout"
+            if live_threshold_key is not None
+            and _is_immediate_timeout_key(live_threshold_key)
+            else "threshold_reached"
+        )
     result = {
         "trial_id": trial_id,
         "stage": stage,
@@ -1385,6 +1460,15 @@ def _run_trial(
         "gpu_energy_joules": live_energy_joules,
         "gpu_temperature_peak_celsius": live_gpu_temperature_peak_celsius,
         "threshold_reason": live_threshold_reason,
+        "timeout_type": (
+            "no_step_progress"
+            if live_threshold_key == "no_step_progress_timeout_seconds"
+            else (
+                live_threshold_key.removesuffix("_seconds")
+                if status == "timeout" and live_threshold_key is not None
+                else None
+            )
+        ),
         "report_path": str(report_path) if report_path.exists() else None,
         "log_path": str(log_path),
     }
@@ -1553,6 +1637,9 @@ def recover_interrupted_session(
     print(f"Stop reason: {summary['stop_reason']}")
     print("Capacity frontier by model:")
     print(json.dumps(summary["capacity_frontier"], indent=2, default=str))
+    if summary["pruned_candidates"]:
+        print("Pruned candidates:")
+        print(json.dumps(summary["pruned_candidates"], indent=2, default=str))
     print("Recommended safe configuration:")
     print(json.dumps(last_safe_config, indent=2, default=str))
     print(f"Full summary: {summary_path.resolve()}")
@@ -1560,7 +1647,7 @@ def recover_interrupted_session(
 
 
 def run_autotune(config_path: Path, plan_only: bool = False) -> dict[str, Any]:
-    """Inventory the machine, execute staged trials, and persist a summary."""
+    """Run autotune with an optional session-owned Windows telemetry producer."""
     controller, base_values = load_autotune_config(config_path)
     if not plan_only:
         session_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
@@ -1568,6 +1655,39 @@ def run_autotune(config_path: Path, plan_only: bool = False) -> dict[str, Any]:
         controller = replace(
             controller, output_dir=controller.output_dir / "sessions" / session_id
         )
+    producer: WindowsTelemetryProducer | None = None
+    if not plan_only and controller.manage_windows_bridge:
+        bridge_path = controller.output_dir / "windows-host.json"
+        controller = replace(controller, windows_bridge_path=bridge_path)
+        producer = WindowsTelemetryProducer(
+            script_path=(
+                Path(__file__).resolve().parent
+                / "windows-gpu-telemetry.ps1"
+            ),
+            output_path=bridge_path,
+            interval_seconds=controller.windows_bridge_interval_seconds,
+            startup_timeout_seconds=(
+                controller.windows_bridge_startup_timeout_seconds
+            ),
+            max_age_seconds=controller.windows_bridge_max_age_seconds,
+        )
+        print("Starting managed Windows GPU/host telemetry...")
+        producer.start()
+        print(f"Windows telemetry ready: {bridge_path}")
+    try:
+        return _run_autotune(controller, base_values, plan_only)
+    finally:
+        if producer is not None:
+            producer.stop()
+            print("Managed Windows telemetry stopped.")
+
+
+def _run_autotune(
+    controller: AutotuneConfig,
+    base_values: dict[str, Any],
+    plan_only: bool = False,
+) -> dict[str, Any]:
+    """Inventory the machine, execute staged trials, and persist a summary."""
     base = CustomPyTorchTrainingConfig.from_mapping(base_values.get("training", {}))
     inventory = hardware_software_inventory(
         controller.output_dir,
@@ -1600,6 +1720,13 @@ def run_autotune(config_path: Path, plan_only: bool = False) -> dict[str, Any]:
             ),
             "windows_bridge_max_age_seconds": (
                 controller.windows_bridge_max_age_seconds
+            ),
+            "manage_windows_bridge": controller.manage_windows_bridge,
+            "windows_bridge_interval_seconds": (
+                controller.windows_bridge_interval_seconds
+            ),
+            "windows_bridge_startup_timeout_seconds": (
+                controller.windows_bridge_startup_timeout_seconds
             ),
         },
         "execution": {
@@ -1641,6 +1768,7 @@ def run_autotune(config_path: Path, plan_only: bool = False) -> dict[str, Any]:
     trials: list[dict[str, Any]] = []
     last_safe: CustomPyTorchTrainingConfig | None = None
     boundary_reasons: list[str] = []
+    pruned_candidates: list[dict[str, Any]] = []
     trial_number = 0
     if controller.strategy == "staged":
         model_candidates = (
@@ -1666,13 +1794,15 @@ def run_autotune(config_path: Path, plan_only: bool = False) -> dict[str, Any]:
             )
             model_safe: CustomPyTorchTrainingConfig | None = None
             axes_to_run = non_model_axes or ("model_name",)
-            for field_name in axes_to_run:
-                field_candidates = (
+            failed_axis_index: int | None = None
+            minimum_failure_was_timeout = False
+            for axis_index, field_name in enumerate(axes_to_run):
+                field_candidates = _ordered_unique(
                     controller.candidates[field_name]
                     if field_name != "model_name"
                     else (model_name,)
                 )
-                for candidate in _ordered_unique(field_candidates):
+                for candidate_index, candidate in enumerate(field_candidates):
                     if trial_number >= controller.max_trials:
                         boundary_reasons.append("max_trials reached")
                         max_trials_reached = True
@@ -1700,9 +1830,32 @@ def run_autotune(config_path: Path, plan_only: bool = False) -> dict[str, Any]:
                         model_safe = candidate_config
                         last_safe = candidate_config
                     else:
+                        result["boundary_axis"] = field_name
+                        result["boundary_value"] = candidate
+                        result["last_safe_value"] = (
+                            getattr(model_safe, field_name)
+                            if model_safe is not None
+                            else None
+                        )
                         boundary_reasons.append(
                             f"{model_name}/{field_name}: "
                             f"{result['status']} at {candidate}"
+                        )
+                        if result["status"] == "timeout":
+                            for skipped in field_candidates[candidate_index + 1 :]:
+                                pruned_candidates.append(
+                                    {
+                                        "model_name": model_name,
+                                        "axis": field_name,
+                                        "candidate": skipped,
+                                        "boundary_value": candidate,
+                                        "last_safe_value": result["last_safe_value"],
+                                        "reason": "higher_than_timed_out_boundary",
+                                    }
+                                )
+                        failed_axis_index = axis_index
+                        minimum_failure_was_timeout = (
+                            model_safe is None and result["status"] == "timeout"
                         )
                         break
                     if controller.cooldown_seconds:
@@ -1711,6 +1864,21 @@ def run_autotune(config_path: Path, plan_only: bool = False) -> dict[str, Any]:
                 if max_trials_reached or model_safe is None:
                     break
             if model_safe is None:
+                if failed_axis_index is not None and minimum_failure_was_timeout:
+                    for skipped_axis in axes_to_run[failed_axis_index + 1 :]:
+                        for skipped in _ordered_unique(
+                            controller.candidates[skipped_axis]
+                        ):
+                            pruned_candidates.append(
+                                {
+                                    "model_name": model_name,
+                                    "axis": skipped_axis,
+                                    "candidate": skipped,
+                                    "boundary_value": None,
+                                    "last_safe_value": None,
+                                    "reason": "minimum_configuration_timed_out",
+                                }
+                            )
                 print(
                     f"MODEL UNSUPPORTED: {model_name} failed its minimum "
                     "configuration; skipping remaining axes."
@@ -1724,12 +1892,42 @@ def run_autotune(config_path: Path, plan_only: bool = False) -> dict[str, Any]:
         )
         candidate_lists = [controller.candidates[axis] for axis in grid_axes]
         combinations = itertools.product(*candidate_lists)
+        grid_active_axis = next(
+            (axis for axis in reversed(grid_axes) if axis != "model_name"),
+            None,
+        )
+        grid_timeout_boundaries: list[dict[str, Any]] = []
         for values in combinations:
             if trial_number >= controller.max_trials:
                 boundary_reasons.append("max_trials reached")
                 break
-            trial_number += 1
             updates = dict(zip(grid_axes, values))
+            matching_boundary = next(
+                (
+                    boundary
+                    for boundary in grid_timeout_boundaries
+                    if all(
+                        updates[name] == value
+                        for name, value in boundary["context"].items()
+                    )
+                    and controller.candidates[boundary["axis"]].index(
+                        updates[boundary["axis"]]
+                    )
+                    >= boundary["candidate_index"]
+                ),
+                None,
+            )
+            if matching_boundary is not None:
+                pruned_candidates.append(
+                    {
+                        **updates,
+                        "axis": matching_boundary["axis"],
+                        "boundary_value": matching_boundary["boundary_value"],
+                        "reason": "dominated_by_timed_out_grid_boundary",
+                    }
+                )
+                continue
+            trial_number += 1
             candidate_config = replace(base, max_examples=record_count, **updates)
             label = "_".join(str(value).replace("/", "_") for value in values)
             trial_id = f"trial-{trial_number:03d}-grid-{label}"
@@ -1743,6 +1941,24 @@ def run_autotune(config_path: Path, plan_only: bool = False) -> dict[str, Any]:
                 boundary_reasons.append(
                     f"grid: {result['status']} at {updates}"
                 )
+                if result["status"] == "timeout" and grid_active_axis is not None:
+                    result["boundary_axis"] = grid_active_axis
+                    result["boundary_value"] = updates[grid_active_axis]
+                    result["last_safe_value"] = None
+                    grid_timeout_boundaries.append(
+                        {
+                            "axis": grid_active_axis,
+                            "boundary_value": updates[grid_active_axis],
+                            "candidate_index": controller.candidates[
+                                grid_active_axis
+                            ].index(updates[grid_active_axis]),
+                            "context": {
+                                name: value
+                                for name, value in updates.items()
+                                if name != grid_active_axis
+                            },
+                        }
+                    )
             if controller.cooldown_seconds:
                 print(f"Cooling down for {controller.cooldown_seconds:g}s...")
                 time.sleep(controller.cooldown_seconds)
@@ -1756,6 +1972,7 @@ def run_autotune(config_path: Path, plan_only: bool = False) -> dict[str, Any]:
             trials, controller.axes, controller.candidates
         ),
         "model_execution": _model_execution_summary(trials),
+        "pruned_candidates": pruned_candidates,
         "stop_reason": (
             "; ".join(boundary_reasons)
             if boundary_reasons
