@@ -26,6 +26,20 @@ Use `--output-dir PATH` or `--run-id NAME` to override those values for one
 run. Every execution writes its adapter and `training-report.json` beneath
 `<output-dir>/<run-id>/`.
 
+## Understanding terminal progress
+
+This command uses the direct `cognityx-train` path. While model weights are
+loading, it displays the Transformers `Loading weights ...` progress row only.
+The direct trainer starts its resource monitor after model loading, baseline
+evaluation, LoRA adapter setup, dataset tokenization, and optimizer
+preparation. Loss and resource progress then appear when optimizer steps
+complete.
+
+This differs from `cognityx-autotune`, whose parent controller monitors the
+child process and maintains a second `LOAD ...` row during weight loading. Use
+the [automatic capacity tuner](autotune.md) when loading-time VRAM, GPU,
+storage, CPU, and RAM telemetry is required.
+
 The checked-in configuration performs one optimizer step with batch size one.
 It uses NF4 4-bit loading, BF16 computation, double quantization, and LoRA
 adapters on Qwen attention projections.

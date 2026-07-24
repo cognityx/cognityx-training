@@ -63,6 +63,18 @@ Training workload is controlled independently with `max_examples`,
 `max_sequence_length`. Live progress includes loss, CPU, main RAM, disk I/O,
 and GPU utilization/memory.
 
+### Direct training versus autotune output
+
+| Command | Weight-loading display | When resource telemetry begins |
+| --- | --- | --- |
+| `cognityx-train` | Transformers `Loading weights ...` progress row | After model loading, baseline evaluation, adapter setup, and optimizer preparation; progress is then printed at completed optimizer steps. |
+| `cognityx-autotune` | Transformers progress plus a second controller-managed `LOAD ...` telemetry row | During model loading and throughout the controlled trial. |
+
+Therefore, seeing only the Transformers progress row while a direct
+`cognityx-train` run loads model weights is expected. Use
+`cognityx-autotune` when live VRAM, GPU, storage, CPU, and RAM measurements are
+needed during loading.
+
 For an evidence-based workflow, first run the one-step hello-world capacity
 baseline, then run the private-fact benefit experiment:
 

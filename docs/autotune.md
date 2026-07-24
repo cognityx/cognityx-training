@@ -132,6 +132,14 @@ carriage returns remain update signals instead of being converted into newline
 records; identical shard updates are deduplicated. Workers receive PTY-backed
 output with the same width as the parent terminal, and telemetry is compacted
 and clipped to prevent row wrapping. Both rows are finalized when loading ends.
+
+This two-row loading display is provided by the `cognityx-autotune` parent
+controller. A standalone `cognityx-train` invocation has no parent controller,
+so it shows only the Transformers loading row and begins its own resource
+monitor after loading and setup finish. See
+[Qwen hello-world fine-tuning](qwen-hello-world.md#understanding-terminal-progress)
+for the direct-command behavior.
+
 `COGNITYX_TRAINING_COMPLETED (optimizer)` means optimizer steps have
 finished; adapter saving and evaluation follow before the worker emits its
 trial-completion marker and the controller starts the next configuration.
