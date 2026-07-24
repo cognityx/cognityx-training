@@ -267,6 +267,27 @@ def test_plan_mode_does_not_start_managed_windows_telemetry(
     assert result == {"plan_only": True}
 
 
+def test_incremental_report_failure_does_not_stop_trial_accounting(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    result = {
+        "trial_id": "trial-001-model-a",
+        "status": "completed",
+        "configuration": {"model_name": "model-a"},
+    }
+    trials = []
+    monkeypatch.setattr(
+        autotune_module,
+        "persist_trial_result",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk unavailable")),
+    )
+
+    autotune_module._record_trial_result(trials, result, tmp_path)
+
+    assert trials == [result]
+    assert "INCREMENTAL REPORT ERROR" in capsys.readouterr().err
+
+
 def test_switching_models_discards_the_previous_worker(monkeypatch) -> None:
     class FakeProcess:
         def poll(self):

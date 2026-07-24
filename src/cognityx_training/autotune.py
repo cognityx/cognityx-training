@@ -27,6 +27,11 @@ from typing import Any, Iterable
 import uuid
 
 from cognityx_training.configuration import CustomPyTorchTrainingConfig
+from cognityx_training.final_report import (
+    persist_trial_result,
+    render_final_safe_combinations,
+    update_final_safe_combinations,
+)
 from cognityx_training.telemetry import (
     WindowsTelemetryProducer,
     query_host,
@@ -1676,10 +1681,51 @@ def run_autotune(config_path: Path, plan_only: bool = False) -> dict[str, Any]:
         print(f"Windows telemetry ready: {bridge_path}")
     try:
         return _run_autotune(controller, base_values, plan_only)
+    except BaseException:
+        if not plan_only:
+            _shutdown_workers()
+            _print_final_safe_combinations(controller.output_dir)
+        raise
     finally:
         if producer is not None:
             producer.stop()
             print("Managed Windows telemetry stopped.")
+
+
+def _record_trial_result(
+    trials: list[dict[str, Any]],
+    result: dict[str, Any],
+    session_dir: Path,
+) -> None:
+    """Durably record a trial and refresh the latest per-model safe report."""
+    trials.append(result)
+    try:
+        persist_trial_result(session_dir, result)
+        update_final_safe_combinations(session_dir)
+    except Exception as exc:
+        print(
+            f"INCREMENTAL REPORT ERROR for {result.get('trial_id')}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _print_final_safe_combinations(session_dir: Path) -> None:
+    """Refresh and print the best durable results without masking training errors."""
+    try:
+        report = update_final_safe_combinations(session_dir)
+    except Exception as exc:
+        print(f"\nFINAL REPORT ERROR: {exc}", file=sys.stderr, flush=True)
+        return
+    print("\n" + render_final_safe_combinations(report), flush=True)
+    print(
+        f"Final JSON: {(session_dir / 'final-safe-combinations.json').resolve()}",
+        flush=True,
+    )
+    print(
+        f"Final Markdown: {(session_dir / 'final-safe-combinations.md').resolve()}",
+        flush=True,
+    )
 
 
 def _run_autotune(
@@ -1824,7 +1870,7 @@ def _run_autotune(
                         controller,
                         dataset_path,
                     )
-                    trials.append(result)
+                    _record_trial_result(trials, result, controller.output_dir)
                     if result["status"] == "completed":
                         current = candidate_config
                         model_safe = candidate_config
@@ -1934,7 +1980,7 @@ def _run_autotune(
             result = _run_trial(
                 trial_id, "grid", candidate_config, controller, dataset_path
             )
-            trials.append(result)
+            _record_trial_result(trials, result, controller.output_dir)
             if result["status"] == "completed":
                 last_safe = candidate_config
             else:
@@ -2008,6 +2054,7 @@ def _run_autotune(
     print(json.dumps(summary["recommended_configuration"], indent=2, default=str))
     print(f"Full summary: {summary_path.resolve()}")
     _shutdown_workers()
+    _print_final_safe_combinations(controller.output_dir)
     return summary
 
 

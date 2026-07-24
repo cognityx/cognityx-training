@@ -351,14 +351,29 @@ Every invocation creates a unique directory:
 ├── hardware inventory in autotune-summary.json
 ├── capacity-dataset.jsonl
 ├── trial-configs/
+├── trial-results/<trial-id>.json
 ├── logs/
 ├── runs/<trial-id>/training-report.json
+├── final-safe-combinations.json
+├── final-safe-combinations.md
 └── autotune-summary.json
 ```
 
-The final shell summary lists every configuration and its outcome, explains
-why the search stopped, prints the recommended safe configuration, and gives
-the full JSON summary path.
+Immediately after every trial finishes, its controller-level result is written
+atomically under `trial-results/`. Completed results automatically refresh the
+JSON and Markdown final-safe-combination reports. The latest successful combined
+configuration for each model replaces that model's earlier entry; timeout,
+threshold, failed, and interrupted trials never become safe recommendations.
+
+No separate reporting command is required. On normal completion the shell
+prints the final safe combinations after the full autotune summary. On Ctrl+C,
+the active trial and workers are stopped and the report is regenerated and
+printed from already durable completed trials. Atomic replacement prevents an
+interrupt from leaving a partially written report.
+
+Each model entry includes its matched trial, maximum sequence length, batch
+size, LoRA rank, training seconds, completed steps, peak GPU power and
+utilization, and longest optimizer-step duration.
 
 !!! warning
     Autotuning intentionally approaches hardware limits. Save unrelated GPU
