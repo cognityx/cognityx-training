@@ -1,0 +1,20 @@
+name: Request documentation publication
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Rebuild public documentation
+        env:
+          GH_TOKEN: ${{ secrets.COGNITYX_DOCS_DISPATCH_TOKEN }}
+        run: |
+          gh api --method POST repos/cognityx/cognityx.github.io/dispatches \
+            -f event_type=documentation-updated \
+            -f "client_payload[repository]=${GITHUB_REPOSITORY}"
