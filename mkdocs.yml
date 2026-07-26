@@ -4,6 +4,7 @@ dev_addr: 127.0.0.1:8125
 theme:
   name: material
 nav:
+  - Cognityx Home: https://cognityx.github.io/
   - Home: index.md
   - Architecture: architecture.md
   - Qwen hello world: qwen-hello-world.md
