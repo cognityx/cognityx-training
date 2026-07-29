@@ -19,7 +19,7 @@ DataForge dataset
 | `experiment_id` | One experimental question or comparison group. |
 | `training_variant_id` | A deterministic hash of the dataset, base model, and result-changing training settings. |
 | `training_run_id` | One physical execution or retry of a variant. |
-| `adapter_id` | The candidate adapter produced by one training run. |
+| `adapter_id` | A globally safe hash of the experiment and physical training run. |
 
 Machine-specific cache paths, output directories, Storage roots, telemetry
 executables, and progress intervals do not affect the variant ID. Dataset
@@ -112,15 +112,16 @@ terminal manifest. Failed staging is retained for diagnosis; successful staging
 is removed only when `retain_local_staging = false`.
 
 Use `verify_published_adapter(adapter_manifest_uri, storage_runtime=runtime)` to
-verify a candidate without loading its base model or allocating a GPU.
+verify a candidate through Storage read streams without loading its base model,
+requiring a native backend path, or allocating a GPU.
 
 ## Evaluation handoff
 
-Baseline and trained outputs are stored as separate JSONL streams with record,
-dataset evidence, decoding, model, and run lineage. A later evaluation service
-can judge those outputs after the training model is unloaded. A later Inference
-workflow can consume the verified adapter manifest. This training workflow does
-not promote, deploy, serve, or release the adapter.
+Baseline and trained outputs are streamed to separate JSONL artifacts with
+record, normalized DataForge evidence, decoding, model, and run lineage. The
+evaluation workflow can judge those saved outputs after the training model is
+unloaded. A later Inference workflow can consume the verified adapter manifest.
+Training publication does not promote, deploy, serve, or release the adapter.
 
 ## Local compatibility mode
 

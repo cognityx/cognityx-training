@@ -11,6 +11,7 @@ from pathlib import Path
 import platform
 import shutil
 import subprocess
+import tempfile
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlparse
 
@@ -57,6 +58,16 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             hasher.update(chunk)
     return hasher.hexdigest()
+
+
+def sha256_stream(source: Any) -> tuple[str, int]:
+    """Hash an open binary stream without requiring a native filesystem path."""
+    hasher = hashlib.sha256()
+    size_bytes = 0
+    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+        hasher.update(chunk)
+        size_bytes += len(chunk)
+    return hasher.hexdigest(), size_bytes
 
 
 def bundle_checksum(files: Iterable[Mapping[str, Any]]) -> str:
@@ -253,12 +264,11 @@ def verify_published_adapter(
         if not isinstance(item, dict):
             raise ValueError("Adapter manifest contains a malformed file entry")
         relative = str(item["path"])
-        path = store.materialize(f"{bundle_root}/{relative}")
-        if path.is_symlink() or not path.is_file():
-            raise ValueError(f"Stored adapter file is unsafe or missing: {relative}")
-        if path.stat().st_size != int(item["size_bytes"]):
+        with store.open(f"{bundle_root}/{relative}") as source:
+            calculated_checksum, calculated_size = sha256_stream(source)
+        if calculated_size != int(item["size_bytes"]):
             raise ValueError(f"Stored adapter size mismatch: {relative}")
-        if sha256_file(path) != item["sha256"]:
+        if calculated_checksum != item["sha256"]:
             raise ValueError(f"Stored adapter checksum mismatch: {relative}")
     calculated_bundle = bundle_checksum(files)
     if calculated_bundle != manifest.get("bundle_checksum"):
@@ -518,24 +528,49 @@ class TrainingPublisher:
         filename: str,
         rows: Iterable[Mapping[str, Any]],
     ) -> tuple[str, str]:
-        content = b"".join(
-            (
-                json.dumps(
-                    dict(row),
-                    sort_keys=True,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-                + "\n"
-            ).encode("utf-8")
-            for row in rows
-        )
-        stored = self.artifact_store.put_bytes(
-            f"{self.run_root}/{filename}",
-            content,
-            media_type="application/x-ndjson",
-        )
-        return stored.uri, hashlib.sha256(content).hexdigest()
+        hasher = hashlib.sha256()
+        temporary_root = getattr(self.temporary_store, "native_path", None)
+        directory = None
+        if callable(temporary_root):
+            try:
+                directory = temporary_root("training-publication")
+                directory.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                directory = None
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix="predictions-",
+            suffix=".jsonl",
+            dir=directory,
+            delete=False,
+        ) as target:
+            temporary_path = Path(target.name)
+            try:
+                for row in rows:
+                    content = (
+                        json.dumps(
+                            dict(row),
+                            sort_keys=True,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                    target.write(content)
+                    hasher.update(content)
+                target.flush()
+            except Exception:
+                temporary_path.unlink(missing_ok=True)
+                raise
+        try:
+            stored = self.artifact_store.put_file(
+                f"{self.run_root}/{filename}",
+                temporary_path,
+                media_type="application/x-ndjson",
+            )
+        finally:
+            temporary_path.unlink(missing_ok=True)
+        return stored.uri, hasher.hexdigest()
 
 
 def prediction_rows(
@@ -548,6 +583,17 @@ def prediction_rows(
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for output in evaluation.get("outputs", []):
+        original_provenance = dict(output.get("provenance") or {})
+        original_metadata = dict(output.get("metadata") or {})
+        combined = {**original_provenance, **original_metadata, **dict(output)}
+        singular_knowledge_unit = combined.get("knowledge_unit_id")
+        knowledge_unit_ids = _normalized_string_list(
+            combined.get("knowledge_unit_ids")
+        )
+        if singular_knowledge_unit is not None:
+            normalized_singular = str(singular_knowledge_unit)
+            if normalized_singular not in knowledge_unit_ids:
+                knowledge_unit_ids.insert(0, normalized_singular)
         rows.append(
             {
                 **ids.to_dict(),
@@ -558,15 +604,35 @@ def prediction_rows(
                 "generated_answer": output.get("generated"),
                 "exact_match": output.get("exact_match"),
                 "contains_expected": output.get("contains_expected"),
-                "knowledge_unit_ids": output.get("knowledge_unit_ids", []),
-                "evidence_ids": output.get("evidence_ids", []),
-                "provenance": output.get("provenance", {}),
+                "knowledge_unit_id": singular_knowledge_unit,
+                "knowledge_unit_ids": knowledge_unit_ids,
+                "evidence_ids": _normalized_string_list(
+                    combined.get("evidence_ids")
+                ),
+                "source_asset_ids": _normalized_string_list(
+                    combined.get("source_asset_ids")
+                ),
+                "document_ids": _normalized_string_list(
+                    combined.get("document_ids")
+                ),
+                "probe_id": combined.get("probe_id"),
+                "probe_class": combined.get("probe_class"),
+                "recipe": combined.get("recipe"),
+                "provenance": original_provenance,
+                "metadata": original_metadata,
                 "decoding": dict(decoding),
                 "base_model": dict(base_model_identity),
                 "prediction_type": prediction_type,
             }
         )
     return rows
+
+
+def _normalized_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    items = value if isinstance(value, (list, tuple, set)) else [value]
+    return list(dict.fromkeys(str(item) for item in items if item is not None))
 
 
 def _package_version() -> str | None:

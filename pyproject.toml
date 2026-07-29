@@ -22,10 +22,14 @@ training = [
     "torch>=2.5",
     "transformers>=4.51",
 ]
+evaluation = [
+    "cognityx-inference; python_version >= '3.12'",
+]
 
 [project.scripts]
 cognityx-train = "cognityx_training.cli:main"
 cognityx-autotune = "cognityx_training.autotune:main"
+cognityx-evaluate = "cognityx_training.evaluation_cli:main"
 
 [dependency-groups]
 dev = [
@@ -39,6 +43,7 @@ testpaths = ["tests"]
 
 [tool.uv.sources]
 cognityx-core = { git = "https://github.com/cognityx/cognityx-core.git" }
+cognityx-inference = { git = "https://github.com/cognityx/cognityx-inference.git" }
 cognityx-storage = { git = "https://github.com/cognityx/cognityx-storage.git" }
 
 [build-system]

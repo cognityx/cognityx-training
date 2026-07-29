@@ -1,0 +1,39 @@
+[evaluation]
+name = "Qwen3-8B DataForge candidate comparison"
+publication_manifests = [
+  "storage://local-main/artifacts/experiments/exp-example/runs/trun-example/publication-manifest.json",
+]
+unload_judge_when_done = true
+maximum_judge_retries = 2
+checkpoint_interval = 10
+minimum_comparable_overlap = 0.80
+
+[judge]
+provider = "local"
+model = "Qwen/Qwen3-14B"
+backend = "vllm"
+profile = "int4"
+server_profile = "qwen3-14b-int4"
+base_url = "http://127.0.0.1:8013"
+manager_url = "http://127.0.0.1:8013"
+auto_start = true
+context_limit_tokens = 32768
+max_output_tokens = 768
+temperature = 0.0
+seed = 42
+timeout_seconds = 300
+
+[evidence]
+required = false
+missing_policy = "reference-only"
+store_evidence_text = false
+
+[gates]
+minimum_record_coverage = 0.95
+minimum_candidate_win_rate = 0.55
+maximum_regression_rate = 0.05
+minimum_reference_correctness = 0.75
+minimum_evidence_faithfulness = 0.75
+maximum_unjudgeable_rate = 0.10
+require_deterministic_non_regression = true
+require_human_approval = true

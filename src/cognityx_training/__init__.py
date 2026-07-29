@@ -11,10 +11,14 @@ from cognityx_training.publication import (
     TrainingPublisher,
     verify_published_adapter,
 )
+from cognityx_training.evaluation_configuration import EvaluationConfig
+from cognityx_training.evaluation_pipeline import EvaluationPipeline
 
 __all__ = [
     "CustomPyTorchTrainerBackend",
     "CustomPyTorchTrainingConfig",
+    "EvaluationConfig",
+    "EvaluationPipeline",
     "AutotuneConfig",
     "AdapterVerificationResult",
     "create_training_backend",
