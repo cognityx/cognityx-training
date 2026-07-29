@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: cognityx/.github/.github/workflows/python-package-ci.yml@714d823b96b8608ae4d54705e71325349cfa1f4a
+    with:
+      python-version: "3.12"
+      run-docs: true
+      run-build: true
+      run-release-verification: false
