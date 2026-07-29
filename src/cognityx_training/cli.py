@@ -1,7 +1,7 @@
 """Command-line entry point for configuration-driven training."""
 
 import argparse
-from dataclasses import replace
+from dataclasses import asdict, replace
 import json
 import os
 import tomllib
@@ -25,6 +25,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--run-id", help="Stable run directory name; defaults to a UTC timestamp."
+    )
+    parser.add_argument(
+        "--storage-config",
+        type=Path,
+        help="Optional StorageRuntime TOML config for DataForge dataset manifests.",
+    )
+    parser.add_argument(
+        "--storage-root",
+        help="Optional local storage root for temporary or built-in StorageRuntime config.",
+    )
+    parser.add_argument(
+        "--dataset-input-mode",
+        choices=["auto", "dataforge_manifest", "legacy_jsonl"],
+        help="Override dataset interpretation mode.",
     )
     parser.add_argument(
         "--print-config",
@@ -54,6 +68,14 @@ def main(argv: list[str] | None = None) -> None:
             run_id=args.run_id or config.run_id,
         )
         config.validate()
+    if args.storage_config is not None or args.storage_root is not None or args.dataset_input_mode is not None:
+        config = replace(
+            config,
+            storage_config=args.storage_config or config.storage_config,
+            storage_root=args.storage_root or config.storage_root,
+            dataset_input_mode=args.dataset_input_mode or config.dataset_input_mode,
+        )
+        config.validate()
     dataset = Dataset(
         name=dataset_values["name"],
         version=str(dataset_values.get("version", "1")),
@@ -62,22 +84,24 @@ def main(argv: list[str] | None = None) -> None:
     if args.print_config:
         print(json.dumps(jsonable_configuration(config), indent=2, sort_keys=True))
     if args.dry_run:
-        from cognityx_training.dataset_pipeline import (
-            load_jsonl_records,
-            partition_records,
-        )
+        from cognityx_training.dataset_pipeline import DataForgeDatasetReader
 
-        records = load_jsonl_records(dataset.uri)
-        training_records, evaluation_records = partition_records(
-            records, config.max_examples
+        reader = DataForgeDatasetReader(
+            dataset.uri,
+            storage_config=config.storage_config,
+            storage_root=config.storage_root,
+            input_mode=config.dataset_input_mode,
         )
+        lineage = reader.lineage()
+        stats = reader.statistics(max_examples=config.max_examples)
         effective_batch_size = (
             config.per_device_train_batch_size * config.gradient_accumulation_steps
         )
         print(
             "Configuration valid. "
-            f"Dataset records: {len(records)} total, "
-            f"{len(training_records)} training, {len(evaluation_records)} evaluation. "
+            f"Dataset lineage: {json.dumps(asdict(lineage), sort_keys=True, default=str)}. "
+            f"Dataset records: {stats.training_records + stats.evaluation_records} total, "
+            f"{stats.selected_training_records} training, {stats.evaluation_records} evaluation. "
             f"Micro batch: {config.per_device_train_batch_size}; "
             f"effective batch: {effective_batch_size}; "
             f"optimizer steps: {config.max_steps}."

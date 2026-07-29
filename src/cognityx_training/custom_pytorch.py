@@ -16,10 +16,9 @@ from cognityx_core.models import TrainingRequest, TrainingResult
 
 from cognityx_training.configuration import CustomPyTorchTrainingConfig
 from cognityx_training.dataset_pipeline import (
-    evaluation_pair,
-    load_jsonl_records,
-    partition_records,
-    render_ift_examples,
+    DataForgeDatasetReader,
+    collate_supervised_batch,
+    encode_supervised_example,
 )
 from cognityx_training.reporting import (
     ResourceMonitor,
@@ -40,7 +39,7 @@ _PERSISTENT_MODEL_CACHE: dict[tuple[Any, ...], tuple[Any, Any]] = {}
 def _evaluate_model(
     model: Any,
     tokenizer: Any,
-    records: list[dict[str, Any]],
+    records: list[Any],
     input_device: Any,
     max_new_tokens: int,
     torch: Any,
@@ -51,7 +50,9 @@ def _evaluate_model(
     model.eval()
     with torch.no_grad():
         for record in records:
-            prompt, expected = evaluation_pair(record)
+            messages = record.messages if hasattr(record, "messages") else record["messages"]
+            prompt = next(item["content"] for item in reversed(messages) if item["role"] == "user")
+            expected = next(item["content"] for item in reversed(messages) if item["role"] == "assistant")
             input_ids = tokenizer.apply_chat_template(
                 [{"role": "user", "content": prompt}],
                 tokenize=True,
@@ -124,15 +125,58 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
                 "Training dependencies are missing. Run `uv sync --extra training`."
             ) from exc
 
-        all_records = load_jsonl_records(request.dataset.uri)
-        records, evaluation_records = partition_records(
-            all_records, self.config.max_examples
+        reader = DataForgeDatasetReader(
+            request.dataset.uri,
+            storage_config=self.config.storage_config,
+            storage_root=self.config.storage_root,
+            input_mode=self.config.dataset_input_mode,
         )
 
         model_source_options = {
             "cache_dir": str(self.config.model_cache_dir),
             "local_files_only": self.config.local_files_only,
         }
+        tokenizer = AutoTokenizer.from_pretrained(
+            self.config.model_name,
+            **model_source_options,
+        )
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        evaluation_records = list(reader.iter_evaluation_records())
+        training_examples: list[dict[str, list[int]]] = []
+        skipped_records: list[dict[str, Any]] = []
+        for record in reader.iter_training_records(max_examples=self.config.max_examples):
+            encoded = encode_supervised_example(tokenizer, record.messages)
+            if len(encoded["input_ids"]) > self.config.max_sequence_length:
+                if self.config.overlength_policy == "skip":
+                    skipped_records.append(
+                        {
+                            "record_id": record.record_id,
+                            "line_number": record.line_number,
+                            "actual_token_count": len(encoded["input_ids"]),
+                            "maximum_sequence_length": self.config.max_sequence_length,
+                            "reason": "overlength",
+                        }
+                    )
+                    continue
+                raise ValueError(
+                    f"Record {record.record_id or record.line_number} exceeds maximum sequence length "
+                    f"({len(encoded['input_ids'])} > {self.config.max_sequence_length}) for {reader.dataset_uri}"
+                )
+            training_examples.append(encoded)
+        preflight = reader.statistics(max_examples=self.config.max_examples)
+        preflight = preflight.__class__(
+            training_records=preflight.training_records,
+            evaluation_records=preflight.evaluation_records,
+            selected_training_records=len(training_examples),
+            skipped_records=len(skipped_records),
+            maximum_observed_token_length=max(
+                (len(item["input_ids"]) for item in training_examples), default=None
+            ),
+            configured_max_sequence_length=self.config.max_sequence_length,
+            split_summary=preflight.split_summary,
+            validation_warnings=preflight.validation_warnings,
+        )
         model_kwargs: dict[str, Any] = {
             "device_map": "auto",
             "dtype": torch.bfloat16 if torch.cuda.is_available() else torch.float32,
@@ -146,7 +190,6 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
                 bnb_4bit_compute_dtype=torch.bfloat16,
                 bnb_4bit_use_double_quant=True,
             )
-
         cache_key = (
             self.config.model_name,
             str(self.config.model_cache_dir),
@@ -155,12 +198,6 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
         )
         cached = _PERSISTENT_MODEL_CACHE.pop(cache_key, None)
         if cached is None:
-            tokenizer = AutoTokenizer.from_pretrained(
-                self.config.model_name,
-                **model_source_options,
-            )
-            if tokenizer.pad_token_id is None:
-                tokenizer.pad_token = tokenizer.eos_token
             model = AutoModelForCausalLM.from_pretrained(
                 self.config.model_name,
                 **model_source_options,
@@ -197,26 +234,15 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
         )
         final_parameters = parameter_counts(model)
 
-        texts = render_ift_examples(records, tokenizer)
-        encoded = tokenizer(
-            texts,
-            truncation=True,
-            padding=True,
-            max_length=self.config.max_sequence_length,
-            return_tensors="pt",
-        )
-        labels = encoded["input_ids"].clone()
-        labels[encoded["attention_mask"] == 0] = -100
-        dataset = torch.utils.data.TensorDataset(
-            encoded["input_ids"],
-            encoded["attention_mask"],
-            labels,
-        )
         loader = torch.utils.data.DataLoader(
-            dataset,
+            training_examples,
             batch_size=self.config.per_device_train_batch_size,
             shuffle=True,
-            generator=torch.Generator().manual_seed(self.config.seed),
+            collate_fn=lambda batch: collate_supervised_batch(
+                batch,
+                pad_token_id=tokenizer.pad_token_id,
+                max_sequence_length=self.config.max_sequence_length,
+            ),
         )
         run_id = self.config.run_id or datetime.now(timezone.utc).strftime(
             "%Y%m%dT%H%M%SZ"
@@ -272,12 +298,12 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
         step_times: list[float] = []
         completed_steps = 0
         while completed_steps < self.config.max_steps:
-            for input_ids, attention_mask, batch_labels in loader:
+            for batch in loader:
                 step_started = time.perf_counter()
                 outputs = model(
-                    input_ids=input_ids.to(input_device),
-                    attention_mask=attention_mask.to(input_device),
-                    labels=batch_labels.to(input_device),
+                    input_ids=batch["input_ids"].to(input_device),
+                    attention_mask=batch["attention_mask"].to(input_device),
+                    labels=batch["labels"].to(input_device),
                 )
                 loss = outputs.loss / self.config.gradient_accumulation_steps
                 loss.backward()
@@ -310,14 +336,7 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
         )
         model.save_pretrained(str(output_dir))
         tokenizer.save_pretrained(str(output_dir))
-        trained_evaluation = _evaluate_model(
-            model,
-            tokenizer,
-            evaluation_records,
-            input_device,
-            self.config.evaluation_max_new_tokens,
-            torch,
-        )
+        trained_evaluation = _evaluate_model(model, tokenizer, evaluation_records, input_device, self.config.evaluation_max_new_tokens, torch)
         runtime_seconds = time.perf_counter() - started
         resources = monitor.stop()
         finished_at = utc_now()
@@ -325,10 +344,10 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
             "train_loss": sum(losses) / len(losses),
             "train_steps": completed_steps,
             "train_runtime_seconds": runtime_seconds,
-            "training_examples": len(dataset),
-            "dataset_examples_available": len(all_records),
-            "dataset_examples_selected": len(records),
-            "evaluation_examples": len(evaluation_records),
+            "training_examples": len(training_examples),
+            "dataset_examples_available": preflight.training_records + preflight.evaluation_records,
+            "dataset_examples_selected": preflight.selected_training_records,
+            "evaluation_examples": preflight.evaluation_records,
             "micro_batch_size": self.config.per_device_train_batch_size,
             "gradient_accumulation_steps": self.config.gradient_accumulation_steps,
             "effective_batch_size": (
@@ -370,6 +389,22 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
                 "name": request.dataset.name,
                 "version": request.dataset.version,
                 "uri": request.dataset.uri,
+                "lineage": {
+                    "dataset_id": reader.lineage().dataset_id,
+                    "dataset_version": reader.lineage().dataset_version,
+                    "dataset_variant_id": reader.lineage().dataset_variant_id,
+                    "dataset_manifest_uri": reader.lineage().dataset_manifest_uri,
+                    "dataset_manifest_checksum": reader.lineage().dataset_manifest_checksum,
+                    "records_uri": reader.lineage().records_uri,
+                    "records_checksum": reader.lineage().records_checksum,
+                    "recipe": reader.lineage().recipe,
+                    "source_manifest_uri": reader.lineage().source_manifest_uri,
+                    "source_manifest_checksum": reader.lineage().source_manifest_checksum,
+                    "split_summary": reader.lineage().split_summary,
+                    "record_counts": reader.lineage().record_counts,
+                    "overlength_policy": reader.lineage().overlength_policy,
+                    "skipped_records": skipped_records,
+                },
             },
             "configuration": jsonable_configuration(self.config),
             "parameter_counts": {

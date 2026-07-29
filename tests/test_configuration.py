@@ -36,6 +36,7 @@ def test_mapping_normalizes_backend_specific_values(tmp_path) -> None:
     assert config.model_cache_dir == tmp_path
     assert config.output_dir == Path("tmp/output")
     assert config.target_modules == ("q_proj", "v_proj")
+    assert config.dataset_input_mode == "auto"
 
 
 def test_factory_creates_custom_backend(tmp_path) -> None:
@@ -53,3 +54,6 @@ def test_invalid_training_configuration_fails_before_loading_model() -> None:
 
     with pytest.raises(ValueError, match="max_examples"):
         CustomPyTorchTrainingConfig(max_examples=0).validate()
+
+    with pytest.raises(ValueError, match="overlength_policy"):
+        CustomPyTorchTrainingConfig(overlength_policy="truncate").validate()

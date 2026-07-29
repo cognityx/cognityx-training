@@ -26,6 +26,10 @@ class CustomPyTorchTrainingConfig(BackendConfig):
     local_files_only: bool = True
     output_dir: Path = Path("/mnt/d/AI/models/cognityx/training/qwen-hello-world")
     run_id: str | None = None
+    dataset_input_mode: str = "auto"
+    storage_config: Path | None = None
+    storage_root: str | Path | None = None
+    overlength_policy: str = "error"
     max_sequence_length: int = 512
     max_examples: int | None = None
     max_steps: int = 1
@@ -59,6 +63,9 @@ class CustomPyTorchTrainingConfig(BackendConfig):
                 normalized[path_field] = Path(normalized[path_field])
         if "target_modules" in normalized:
             normalized["target_modules"] = tuple(normalized["target_modules"])
+        for path_field in ("storage_config",):
+            if path_field in normalized and normalized[path_field] is not None:
+                normalized[path_field] = Path(normalized[path_field])
         config = cls(**normalized)
         config.validate()
         return config
@@ -99,3 +106,9 @@ class CustomPyTorchTrainingConfig(BackendConfig):
             not self.run_id or Path(self.run_id).name != self.run_id
         ):
             raise ValueError("run_id must be a non-empty file-name-safe value.")
+        if self.dataset_input_mode not in {"auto", "dataforge_manifest", "legacy_jsonl"}:
+            raise ValueError("dataset_input_mode must be auto, dataforge_manifest, or legacy_jsonl.")
+        if self.overlength_policy not in {"error", "skip"}:
+            raise ValueError("overlength_policy must be error or skip.")
+        if self.storage_config is not None and not self.storage_config.exists():
+            raise ValueError(f"storage_config does not exist: {self.storage_config}")

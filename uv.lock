@@ -343,11 +343,25 @@ version = "0.1.0"
 source = { git = "https://github.com/cognityx/cognityx-core.git#f359ddcbca0c2ab67f45adb0e630ce5079057a5a" }
 
 [[package]]
+name = "cognityx-resource"
+version = "0.1.0"
+source = { git = "https://github.com/cognityx/cognityx-resource.git#2f19066969dae40dd4775b0786278f1da0d24c05" }
+
+[[package]]
+name = "cognityx-storage"
+version = "0.1.0"
+source = { git = "https://github.com/cognityx/cognityx-storage.git#6ee8cb48af60d35896219a3388fdb84516fbaa86" }
+dependencies = [
+    { name = "cognityx-resource" },
+]
+
+[[package]]
 name = "cognityx-training"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "cognityx-core" },
+    { name = "cognityx-storage" },
 ]
 
 [package.optional-dependencies]
@@ -373,6 +387,7 @@ requires-dist = [
     { name = "accelerate", marker = "extra == 'training'", specifier = ">=1.2" },
     { name = "bitsandbytes", marker = "extra == 'training'", specifier = ">=0.45" },
     { name = "cognityx-core", git = "https://github.com/cognityx/cognityx-core.git" },
+    { name = "cognityx-storage", git = "https://github.com/cognityx/cognityx-storage.git" },
     { name = "datasets", marker = "extra == 'training'", specifier = ">=3.2" },
     { name = "peft", marker = "extra == 'training'", specifier = ">=0.14" },
     { name = "psutil", marker = "extra == 'training'", specifier = ">=6.1" },

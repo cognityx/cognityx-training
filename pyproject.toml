@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.11"
 dependencies = [
     "cognityx-core",
+    "cognityx-storage",
 ]
 
 [project.optional-dependencies]
@@ -35,6 +36,7 @@ dev = [
 
 [tool.uv.sources]
 cognityx-core = { git = "https://github.com/cognityx/cognityx-core.git" }
+cognityx-storage = { git = "https://github.com/cognityx/cognityx-storage.git" }
 
 [build-system]
 requires = ["uv_build>=0.11.29,<0.12.0"]

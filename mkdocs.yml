@@ -8,6 +8,7 @@ nav:
   - Home: index.md
   - Architecture: architecture.md
   - Qwen hello world: qwen-hello-world.md
+  - DataForge datasets: dataforge-training.md
   - Capacity and benefit validation: two-phase-validation.md
   - Automatic capacity tuning: autotune.md
   - API: api.md

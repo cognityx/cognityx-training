@@ -1,0 +1,30 @@
+[training]
+backend = "custom-pytorch"
+model_name = "Qwen/Qwen3-14B"
+model_cache_dir = "/mnt/d/AI/models/huggingface/hub"
+local_files_only = true
+output_dir = "/mnt/d/AI/models/cognityx/training/dataforge-smoke"
+max_sequence_length = 128
+max_examples = 2
+max_steps = 1
+per_device_train_batch_size = 1
+gradient_accumulation_steps = 1
+learning_rate = 0.0002
+load_in_4bit = true
+lora_rank = 8
+lora_alpha = 16
+lora_dropout = 0.05
+progress_interval_steps = 1
+evaluation_max_new_tokens = 16
+resource_sample_interval_seconds = 1.0
+host_telemetry_source = "auto"
+nvidia_smi_path = "nvidia-smi"
+target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+dataset_input_mode = "dataforge_manifest"
+storage_root = ""
+overlength_policy = "error"
+
+[dataset]
+name = "example-dataforge"
+version = "1"
+uri = "storage://local-main/datasets/example-dataforge/1/manifest.json"
