@@ -135,6 +135,7 @@ def _evaluate_model(
             ).strip()
             normalized_expected = " ".join(expected.lower().split())
             normalized_generated = " ".join(generated.lower().split())
+            record_metadata = dict(getattr(record, "metadata", {}))
             results.append(
                 {
                     "record_id": getattr(record, "record_id", None),
@@ -144,14 +145,13 @@ def _evaluate_model(
                     "exact_match": normalized_generated == normalized_expected,
                     "contains_expected": normalized_expected in normalized_generated,
                     "knowledge_unit_ids": list(
-                        getattr(record, "metadata", {}).get("knowledge_unit_ids", [])
+                        record_metadata.get("knowledge_unit_ids", [])
                     ),
                     "evidence_ids": list(
-                        getattr(record, "metadata", {}).get("evidence_ids", [])
+                        record_metadata.get("evidence_ids", [])
                     ),
-                    "provenance": dict(
-                        getattr(record, "metadata", {}).get("provenance", {})
-                    ),
+                    "provenance": dict(record_metadata.get("provenance", {})),
+                    "metadata": record_metadata,
                 }
             )
     if was_training:

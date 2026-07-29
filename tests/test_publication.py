@@ -213,7 +213,8 @@ def test_retries_have_unique_run_and_adapter_ids() -> None:
     first_run = training_run_id()
     second_run = training_run_id()
     assert first_run != second_run
-    assert adapter_id(first_run) != adapter_id(second_run)
+    assert adapter_id("exp-one", first_run) != adapter_id("exp-one", second_run)
+    assert adapter_id("exp-one", first_run) != adapter_id("exp-two", first_run)
 
 
 def test_experiment_and_variant_manifests_are_idempotent(tmp_path: Path) -> None:
@@ -284,7 +285,7 @@ def test_atomic_publication_verifies_and_removes_staging(tmp_path: Path) -> None
     assert verification.valid is True
     assert verification.adapter_id == publisher.ids.adapter_id
     assert result.adapter_uri == (
-        "storage://local-main/models/adapters/adp-fixture-run/1"
+        f"storage://local-main/models/adapters/{publisher.ids.adapter_id}/1"
     )
     assert result.publication_manifest_uri == (
         "storage://local-main/artifacts/experiments/exp-demo/"
@@ -325,6 +326,34 @@ def test_prediction_jsonl_is_published_with_lineage(tmp_path: Path) -> None:
     assert baseline["adapter_id"] is None
     assert trained["prediction_type"] == "trained"
     assert trained["adapter_id"] == publisher.ids.adapter_id
+
+
+def test_prediction_jsonl_uses_streamed_file_publication(tmp_path: Path) -> None:
+    publisher, identity = _publisher(tmp_path)
+    _prepare(publisher, identity)
+
+    class StreamOnlyStore:
+        def __init__(self, wrapped) -> None:
+            self.wrapped = wrapped
+            self.jsonl_files = 0
+
+        def put_bytes(self, key, content, **kwargs):
+            if key.endswith(".jsonl"):
+                raise AssertionError("prediction JSONL must not use put_bytes")
+            return self.wrapped.put_bytes(key, content, **kwargs)
+
+        def put_file(self, key, source, **kwargs):
+            if key.endswith(".jsonl"):
+                self.jsonl_files += 1
+            return self.wrapped.put_file(key, source, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+
+    wrapped = StreamOnlyStore(publisher.artifact_store)
+    publisher.artifact_store = wrapped
+    _complete(publisher, _adapter_staging(tmp_path))
+    assert wrapped.jsonl_files == 2
 
 
 def test_terminal_manifest_is_written_last(tmp_path: Path) -> None:
@@ -418,6 +447,14 @@ def test_prediction_rows_preserve_evidence_provenance(tmp_path: Path) -> None:
                     "contains_expected": True,
                     "knowledge_unit_ids": ["ku-1"],
                     "evidence_ids": ["ev-1"],
+                    "metadata": {
+                        "knowledge_unit_id": "ku-singular",
+                        "source_asset_ids": ["asset-1"],
+                        "document_ids": ["doc-1"],
+                        "probe_id": "probe-1",
+                        "probe_class": "knowledge",
+                        "recipe": "knowledge-unit-qa",
+                    },
                     "provenance": {"source": "asset-1"},
                 }
             ]
@@ -427,9 +464,38 @@ def test_prediction_rows_preserve_evidence_provenance(tmp_path: Path) -> None:
         base_model_identity=_base_model(),
         decoding={"do_sample": False},
     )
-    assert rows[0]["knowledge_unit_ids"] == ["ku-1"]
+    assert rows[0]["knowledge_unit_id"] == "ku-singular"
+    assert rows[0]["knowledge_unit_ids"] == ["ku-singular", "ku-1"]
     assert rows[0]["evidence_ids"] == ["ev-1"]
+    assert rows[0]["source_asset_ids"] == ["asset-1"]
+    assert rows[0]["document_ids"] == ["doc-1"]
+    assert rows[0]["probe_id"] == "probe-1"
     assert rows[0]["adapter_id"] == ids.adapter_id
+
+
+def test_adapter_verification_does_not_materialize(tmp_path: Path) -> None:
+    publisher, identity = _publisher(tmp_path)
+    _prepare(publisher, identity)
+    result = _complete(publisher, _adapter_staging(tmp_path))
+    original_for_profile = publisher.storage_runtime.for_profile
+
+    class OpenOnlyStore:
+        def __init__(self, wrapped) -> None:
+            self.wrapped = wrapped
+
+        def materialize(self, key):
+            raise AssertionError(f"materialize must not be called: {key}")
+
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+
+    publisher.storage_runtime.for_profile = lambda *args, **kwargs: OpenOnlyStore(
+        original_for_profile(*args, **kwargs)
+    )
+    assert verify_published_adapter(
+        result.adapter_manifest_uri,
+        storage_runtime=publisher.storage_runtime,
+    ).valid
 
 
 class RecordingStore:

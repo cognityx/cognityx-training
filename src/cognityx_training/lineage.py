@@ -50,9 +50,14 @@ def training_run_id(value: str | None = None) -> str:
     )
 
 
-def adapter_id(run_id: str) -> str:
-    validated = validate_lineage_id(run_id, prefix="trun-")
-    return validate_lineage_id(f"adp-{validated.removeprefix('trun-')}", prefix="adp-")
+def adapter_id(experiment: str, run_id: str) -> str:
+    """Build a globally safe adapter identity for one experiment run."""
+    validated_experiment = validate_lineage_id(experiment, prefix="exp-")
+    validated_run = validate_lineage_id(run_id, prefix="trun-")
+    digest = hashlib.sha256(
+        f"{validated_experiment}\x1f{validated_run}".encode("utf-8")
+    ).hexdigest()
+    return validate_lineage_id(f"adp-{digest[:24]}", prefix="adp-")
 
 
 def variant_identity_checksum(payload: Mapping[str, Any]) -> str:
@@ -94,5 +99,5 @@ def build_lineage_ids(
         experiment_id=exp_id,
         training_variant_id=training_variant_id(canonical_variant_identity),
         training_run_id=run_id,
-        adapter_id=adapter_id(run_id),
+        adapter_id=adapter_id(exp_id, run_id),
     )
