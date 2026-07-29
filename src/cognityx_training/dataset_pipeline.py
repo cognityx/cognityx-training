@@ -214,17 +214,13 @@ def resolve_dataset_source(
         return mode, Path(parsed.path if parsed.scheme else dataset_uri).expanduser(), None
     if parsed.scheme != "storage":
         raise ValueError(f"DataForge manifest mode requires a storage:// URI, got: {dataset_uri}")
-    runtime = storage_runtime
-    if runtime is None:
-        from cognityx_storage import StorageConfig, StorageRuntime
+    from cognityx_training.storage_runtime import resolve_storage_runtime
 
-        runtime = (
-            StorageRuntime.load(config_file=storage_config)
-            if storage_config
-            else StorageRuntime.from_config(
-                StorageConfig.built_in(root=storage_root or "/tmp/cognityx-training-storage")
-            )
-        )
+    runtime = resolve_storage_runtime(
+        storage_runtime=storage_runtime,
+        storage_config=storage_config,
+        storage_root=storage_root,
+    )
     store = runtime.for_profile(parsed.netloc, role_name="dataset")
     return mode, store, {"runtime": runtime, "key": parsed.path.lstrip("/")}
 
@@ -410,6 +406,11 @@ class DataForgeDatasetReader:
 
 
 def _assistant_mask_from_template(tokenizer: Any, messages: Sequence[dict[str, str]]) -> tuple[list[int], list[int]]:
+    chat_template = getattr(tokenizer, "chat_template", None)
+    if isinstance(chat_template, str) and "{% generation" not in chat_template:
+        raise LookupError(
+            "Tokenizer chat template does not declare assistant generation boundaries"
+        )
     rendered = tokenizer.apply_chat_template(
         list(messages),
         tokenize=True,
@@ -418,7 +419,11 @@ def _assistant_mask_from_template(tokenizer: Any, messages: Sequence[dict[str, s
         return_assistant_tokens_mask=True,
     )
     input_ids = rendered.get("input_ids")
-    mask = rendered.get("assistant_tokens_mask") or rendered.get("assistant_mask")
+    mask = rendered.get("assistant_tokens_mask")
+    if mask is None:
+        mask = rendered.get("assistant_mask")
+    if mask is None:
+        mask = rendered.get("assistant_masks")
     if input_ids is None or mask is None:
         raise LookupError("Tokenizer did not provide assistant token mask")
     if len(input_ids) != len(mask):
@@ -449,8 +454,10 @@ def _fallback_mask_from_prefixes(tokenizer: Any, messages: Sequence[dict[str, st
             input_ids = rendered_ids
             labels = [-100] * len(rendered_ids)
             continue
-        if len(rendered_ids) < len(input_ids):
-            raise ValueError("Tokenizer fallback produced non-monotonic chat template length")
+        if rendered_ids[: len(input_ids)] != input_ids:
+            raise ValueError(
+                "Tokenizer fallback rewrote previously rendered chat template tokens"
+            )
         new_tokens = rendered_ids[len(input_ids) :]
         input_ids = rendered_ids
         if message["role"] == "assistant":
@@ -474,6 +481,19 @@ def encode_supervised_example(
     try:
         input_ids, labels = _assistant_mask_from_template(tokenizer, messages)
     except LookupError:
+        input_ids, labels = _fallback_mask_from_prefixes(tokenizer, messages)
+    except TypeError as exc:
+        message = str(exc)
+        unsupported_mask_option = (
+            "return_assistant_tokens_mask" in message
+            and (
+                "unexpected keyword" in message
+                or "unexpected keyword argument" in message
+                or "unsupported" in message.lower()
+            )
+        )
+        if not unsupported_mask_option:
+            raise
         input_ids, labels = _fallback_mask_from_prefixes(tokenizer, messages)
     if max_sequence_length is not None and len(input_ids) > max_sequence_length:
         raise ValueError(

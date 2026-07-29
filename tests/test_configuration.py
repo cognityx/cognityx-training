@@ -22,6 +22,8 @@ def test_default_is_one_step_qwen3_14b_qlora() -> None:
     assert config.max_steps == 1
     assert config.max_examples is None
     assert config.load_in_4bit is True
+    assert config.publication_mode == "local"
+    assert config.data_order == "source"
 
 
 def test_mapping_normalizes_backend_specific_values(tmp_path) -> None:
@@ -57,3 +59,12 @@ def test_invalid_training_configuration_fails_before_loading_model() -> None:
 
     with pytest.raises(ValueError, match="overlength_policy"):
         CustomPyTorchTrainingConfig(overlength_policy="truncate").validate()
+
+    with pytest.raises(ValueError, match="data_order"):
+        CustomPyTorchTrainingConfig(data_order="shuffle").validate()
+
+    with pytest.raises(ValueError, match="publication_mode"):
+        CustomPyTorchTrainingConfig(publication_mode="fallback").validate()
+
+    with pytest.raises(ValueError, match="exp-"):
+        CustomPyTorchTrainingConfig(experiment_id="../unsafe").validate()

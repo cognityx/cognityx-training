@@ -27,6 +27,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--run-id", help="Stable run directory name; defaults to a UTC timestamp."
     )
     parser.add_argument(
+        "--experiment-id",
+        help="Experiment identity; defaults to a generated exp-* identifier.",
+    )
+    parser.add_argument(
         "--storage-config",
         type=Path,
         help="Optional StorageRuntime TOML config for DataForge dataset manifests.",
@@ -59,13 +63,35 @@ def main(argv: list[str] | None = None) -> None:
     with args.config.open("rb") as source:
         values = tomllib.load(source)
     training = values.get("training", {})
+    experiment_values = values.get("experiment", {})
+    publication_values = values.get("publication", {})
     dataset_values = values.get("dataset", {})
-    config = CustomPyTorchTrainingConfig.from_mapping(training)
-    if args.output_dir is not None or args.run_id is not None:
+    config = CustomPyTorchTrainingConfig.from_mapping(
+        {
+            **training,
+            "experiment_id": experiment_values.get("id"),
+            "experiment_name": experiment_values.get("name"),
+            "experiment_description": experiment_values.get("description"),
+            "experiment_created_by": experiment_values.get("created_by"),
+            "experiment_tags": experiment_values.get("tags", []),
+            "publication_mode": publication_values.get("mode", "local"),
+            "retain_local_staging": publication_values.get(
+                "retain_local_staging",
+                False,
+            ),
+        }
+    )
+    if (
+        args.output_dir is not None
+        or args.run_id is not None
+        or args.experiment_id is not None
+    ):
         config = replace(
             config,
             output_dir=args.output_dir or config.output_dir,
-            run_id=args.run_id or config.run_id,
+            run_id=None if args.run_id is not None else config.run_id,
+            training_run_id=args.run_id or config.training_run_id,
+            experiment_id=args.experiment_id or config.experiment_id,
         )
         config.validate()
     if args.storage_config is not None or args.storage_root is not None or args.dataset_input_mode is not None:
@@ -125,9 +151,19 @@ def main(argv: list[str] | None = None) -> None:
     result = create_training_backend(config).train(TrainingRequest(dataset=dataset))
     report_uri = getattr(result, "report_uri", None) or result.metrics.get("report_uri")
     if os.environ.get("COGNITYX_AUTOTUNE_WORKER") != "1":
-        print(f"Artifact: {result.artifact.uri}")
-        print(f"Metrics: {dict(result.metrics)}")
-        print(f"Report: {report_uri}")
+        structured = {
+            "experiment_id": result.metrics.get("experiment_id"),
+            "training_variant_id": result.metrics.get("training_variant_id"),
+            "training_run_id": result.metrics.get("training_run_id"),
+            "adapter_id": result.metrics.get("adapter_id"),
+            "adapter_manifest_uri": result.metrics.get("adapter_manifest_uri"),
+            "training_report_uri": report_uri,
+            "publication_manifest_uri": result.metrics.get(
+                "publication_manifest_uri"
+            ),
+            "artifact_uri": result.artifact.uri,
+        }
+        print(json.dumps(structured, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

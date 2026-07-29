@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from dataclasses import asdict
+import hashlib
 import gc
 import os
 from pathlib import Path
 import subprocess
 import time
 from typing import Any
-import uuid
 
 from cognityx_core import Artifact, ModelArtifactRegistry, TrainingBackend
 from cognityx_core.models import TrainingRequest, TrainingResult
@@ -22,6 +22,13 @@ from cognityx_training.dataset_pipeline import (
     iter_selected_training_examples,
     preflight_dataset,
 )
+from cognityx_training.lineage import build_lineage_ids
+from cognityx_training.publication import (
+    TrainingPublisher,
+    canonical_variant_identity,
+    prediction_rows,
+    runtime_environment,
+)
 from cognityx_training.reporting import (
     ResourceMonitor,
     directory_size,
@@ -33,6 +40,7 @@ from cognityx_training.reporting import (
     write_training_report,
 )
 from cognityx_training.telemetry import query_host, query_nvidia_gpus
+from cognityx_training.storage_runtime import resolve_storage_runtime
 
 
 _PERSISTENT_MODEL_CACHE: dict[tuple[Any, ...], tuple[Any, Any]] = {}
@@ -129,11 +137,21 @@ def _evaluate_model(
             normalized_generated = " ".join(generated.lower().split())
             results.append(
                 {
+                    "record_id": getattr(record, "record_id", None),
                     "prompt": prompt,
                     "expected": expected,
                     "generated": generated,
                     "exact_match": normalized_generated == normalized_expected,
                     "contains_expected": normalized_expected in normalized_generated,
+                    "knowledge_unit_ids": list(
+                        getattr(record, "metadata", {}).get("knowledge_unit_ids", [])
+                    ),
+                    "evidence_ids": list(
+                        getattr(record, "metadata", {}).get("evidence_ids", [])
+                    ),
+                    "provenance": dict(
+                        getattr(record, "metadata", {}).get("provenance", {})
+                    ),
                 }
             )
     if was_training:
@@ -158,12 +176,30 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
         self,
         config: CustomPyTorchTrainingConfig,
         artifact_registry: ModelArtifactRegistry | None = None,
+        storage_runtime: Any | None = None,
     ) -> None:
         config.validate()
         self.config = config
         self.artifact_registry = artifact_registry
+        self.storage_runtime = storage_runtime
+        self._active_publisher: TrainingPublisher | None = None
+        self._publication_phase = "initialization"
 
     def train(self, request: TrainingRequest) -> TrainingResult:
+        """Execute training and preserve an immutable failure record when possible."""
+        self._active_publisher = None
+        self._publication_phase = "initialization"
+        try:
+            return self._train(request)
+        except BaseException as exc:
+            if self._active_publisher is not None:
+                self._active_publisher.publish_failure(
+                    exc,
+                    phase=self._publication_phase,
+                )
+            raise
+
+    def _train(self, request: TrainingRequest) -> TrainingResult:
         """Execute LoRA/QLoRA supervised fine-tuning.
 
         Heavy training libraries are imported lazily so configuration, factories,
@@ -173,6 +209,7 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
             import torch
             from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
             from transformers import (
+                AutoConfig,
                 AutoModelForCausalLM,
                 AutoTokenizer,
                 BitsAndBytesConfig,
@@ -182,10 +219,14 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
                 "Training dependencies are missing. Run `uv sync --extra training`."
             ) from exc
 
-        reader = DataForgeDatasetReader(
-            request.dataset.uri,
+        storage_runtime = resolve_storage_runtime(
+            storage_runtime=self.storage_runtime,
             storage_config=self.config.storage_config,
             storage_root=self.config.storage_root,
+        )
+        reader = DataForgeDatasetReader(
+            request.dataset.uri,
+            storage_runtime=storage_runtime,
             input_mode=self.config.dataset_input_mode,
         )
 
@@ -193,9 +234,14 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
             "cache_dir": str(self.config.model_cache_dir),
             "local_files_only": self.config.local_files_only,
         }
+        if self.config.model_revision is not None:
+            model_source_options["revision"] = self.config.model_revision
+        tokenizer_source_options = dict(model_source_options)
+        if self.config.tokenizer_revision is not None:
+            tokenizer_source_options["revision"] = self.config.tokenizer_revision
         tokenizer = AutoTokenizer.from_pretrained(
             self.config.model_name,
-            **model_source_options,
+            **tokenizer_source_options,
         )
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
@@ -206,6 +252,63 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
             max_sequence_length=self.config.max_sequence_length,
             overlength_policy=self.config.overlength_policy,
         )
+        model_config = AutoConfig.from_pretrained(
+            self.config.model_name,
+            **model_source_options,
+        )
+        chat_template = getattr(tokenizer, "chat_template", None)
+        base_model_identity = {
+            "name": self.config.model_name,
+            "requested_revision": self.config.model_revision,
+            "resolved_revision": getattr(model_config, "_commit_hash", None),
+            "tokenizer_revision": (
+                getattr(tokenizer, "_commit_hash", None)
+                or self.config.tokenizer_revision
+            ),
+            "chat_template_checksum": (
+                hashlib.sha256(chat_template.encode("utf-8")).hexdigest()
+                if isinstance(chat_template, str)
+                else None
+            ),
+        }
+        variant_identity = canonical_variant_identity(
+            self.config,
+            preflight.lineage,
+            base_model_identity=base_model_identity,
+        )
+        ids = build_lineage_ids(
+            variant_identity,
+            requested_experiment_id=self.config.experiment_id,
+            requested_run_id=self.config.training_run_id or self.config.run_id,
+        )
+        publisher: TrainingPublisher | None = None
+        if self.config.publication_mode == "storage":
+            publisher = TrainingPublisher(
+                storage_runtime,
+                ids,
+                experiment_name=self.config.experiment_name,
+                experiment_description=self.config.experiment_description,
+                experiment_created_by=self.config.experiment_created_by,
+                experiment_tags=self.config.experiment_tags,
+            )
+            self._active_publisher = publisher
+            self._publication_phase = "request-publication"
+            publisher.publish_experiment()
+            publisher.publish_variant(
+                variant_identity,
+                dataset_lineage=preflight.lineage,
+                base_model_identity=base_model_identity,
+            )
+            publisher.publish_training_request(
+                dataset_lineage=preflight.lineage,
+                normalized_request=variant_identity["training"],
+                base_model_identity=base_model_identity,
+                publication_mode=self.config.publication_mode,
+            )
+        self._publication_phase = "model-loading"
+        torch.manual_seed(self.config.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self.config.seed)
         model_kwargs: dict[str, Any] = {
             "device_map": "auto",
             "dtype": torch.bfloat16 if torch.cuda.is_available() else torch.float32,
@@ -278,10 +381,12 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
                 pad_token_id=tokenizer.pad_token_id,
             ),
         )
-        run_id = self.config.run_id or datetime.now(timezone.utc).strftime(
-            "%Y%m%dT%H%M%SZ"
-        ) + f"-{uuid.uuid4().hex[:8]}"
-        output_dir = Path(self.config.output_dir) / run_id
+        staging_segment = (
+            self.config.run_id
+            if self.config.publication_mode == "local" and self.config.run_id
+            else ids.training_run_id
+        )
+        output_dir = Path(self.config.output_dir) / staging_segment
         output_dir.mkdir(parents=True, exist_ok=True)
         optimizer = torch.optim.AdamW(
             (parameter for parameter in model.parameters() if parameter.requires_grad),
@@ -325,6 +430,7 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
             interval_seconds=self.config.resource_sample_interval_seconds,
         )
         print("COGNITYX_TRAINING_STARTED", flush=True)
+        self._publication_phase = "training"
         monitor.start()
         started_at = utc_now()
         started = time.perf_counter()
@@ -368,6 +474,7 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
             "COGNITYX_TRAINING_COMPLETED (optimizer); saving adapter and evaluating...",
             flush=True,
         )
+        self._publication_phase = "adapter-staging"
         model.save_pretrained(str(output_dir))
         tokenizer.save_pretrained(str(output_dir))
         trained_evaluation = _evaluate_model(
@@ -378,6 +485,7 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
             self.config.evaluation_max_new_tokens,
             torch,
         )
+        self._publication_phase = "reporting"
         runtime_seconds = time.perf_counter() - started
         resources = monitor.stop()
         finished_at = utc_now()
@@ -396,12 +504,18 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
                 * self.config.gradient_accumulation_steps
             ),
         }
+        environment = runtime_environment(
+            storage_runtime,
+            torch_module=torch,
+            base_model_identity=base_model_identity,
+        )
 
         artifact = Artifact(
             name=f"{request.dataset.name}-qwen-adapter",
             version="0.1.0",
             uri=output_dir.resolve().as_uri(),
             metadata={
+                **ids.to_dict(),
                 "base_model": self.config.model_name,
                 "model_cache_dir": str(self.config.model_cache_dir),
                 "local_files_only": self.config.local_files_only,
@@ -410,7 +524,10 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
                 "configuration": jsonable_configuration(self.config),
             },
         )
-        if self.artifact_registry is not None:
+        if (
+            self.artifact_registry is not None
+            and self.config.publication_mode == "local"
+        ):
             artifact = self.artifact_registry.register(artifact)
         adapter_gpu_bytes = sum(
             parameter.numel() * parameter.element_size()
@@ -419,13 +536,21 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
         )
         report = {
             "schema_version": "1.0",
-            "run_id": run_id,
+            "run_id": ids.training_run_id,
+            **ids.to_dict(),
             "status": "completed",
             "started_at": started_at,
             "finished_at": finished_at,
             "duration_seconds": runtime_seconds,
             "training_type": "qlora" if self.config.load_in_4bit else "lora",
-            "model": {"name": self.config.model_name, "output_uri": artifact.uri},
+            "model": {
+                "name": self.config.model_name,
+                "output_uri": (
+                    publisher.model_store.uri(publisher.adapter_root)
+                    if publisher is not None
+                    else artifact.uri
+                ),
+            },
             "dataset": {
                 "name": request.dataset.name,
                 "version": request.dataset.version,
@@ -446,10 +571,13 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
                     "split_summary": preflight.statistics.split_summary,
                     "record_counts": preflight.lineage.record_counts,
                     "overlength_policy": preflight.lineage.overlength_policy,
-                    "skipped_records": list(preflight.skipped_records),
+                    "skipped_records": list(
+                        preflight.statistics.skipped_record_samples
+                    ),
                 },
             },
             "configuration": jsonable_configuration(self.config),
+            "data_order": self.config.data_order,
             "parameter_counts": {
                 "original_total": original_parameters["total"],
                 "original_trainable": original_parameters["trainable"],
@@ -476,14 +604,14 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
                 "gpu_resident_bytes": adapter_gpu_bytes,
                 "gpu_resident_peak_bytes": adapter_gpu_bytes,
                 "serialized_size_bytes": directory_size(output_dir),
-                "saved_uri": artifact.uri,
+                "saved_uri": (
+                    publisher.model_store.uri(publisher.adapter_root)
+                    if publisher is not None
+                    else artifact.uri
+                ),
             },
             "metrics": metrics,
-            "environment": {
-                "torch_version": torch.__version__,
-                "cuda_available": torch.cuda.is_available(),
-                "cuda_version": torch.version.cuda,
-            },
+            "environment": environment,
             "error": None,
         }
         reuse_enabled = os.environ.get("COGNITYX_REUSE_LOADED_MODEL") == "1"
@@ -521,13 +649,74 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
                 ),
             )
         report["base_model_reuse"] = cleanup
-        report_path = write_training_report(report, output_dir)
-        metrics["report_uri"] = report_path.resolve().as_uri()
+        metrics.update(ids.to_dict())
+        if publisher is not None:
+            self._publication_phase = "storage-publication"
+            decoding = {
+                "max_new_tokens": self.config.evaluation_max_new_tokens,
+                "do_sample": False,
+            }
+            publication = publisher.publish_completed_run(
+                staging_directory=output_dir,
+                dataset_lineage=preflight.lineage,
+                base_model_identity=base_model_identity,
+                adapter_details={
+                    "type": "qlora" if self.config.load_in_4bit else "lora",
+                    "format": "peft",
+                    "rank": self.config.lora_rank,
+                    "alpha": self.config.lora_alpha,
+                    "dropout": self.config.lora_dropout,
+                    "target_modules": list(self.config.target_modules),
+                },
+                resolved_config=jsonable_configuration(self.config),
+                environment=environment,
+                training_report=report,
+                metrics=metrics,
+                baseline_predictions=prediction_rows(
+                    baseline_evaluation,
+                    prediction_type="baseline",
+                    ids=ids,
+                    base_model_identity=base_model_identity,
+                    decoding=decoding,
+                ),
+                trained_predictions=prediction_rows(
+                    trained_evaluation,
+                    prediction_type="trained",
+                    ids=ids,
+                    base_model_identity=base_model_identity,
+                    decoding=decoding,
+                ),
+                retain_local_staging=self.config.retain_local_staging,
+            )
+            artifact = Artifact(
+                name=artifact.name,
+                version="1",
+                uri=publication.adapter_uri,
+                metadata={
+                    **dict(artifact.metadata),
+                    "adapter_manifest_uri": publication.adapter_manifest_uri,
+                    "publication_manifest_uri": publication.publication_manifest_uri,
+                },
+            )
+            metrics.update(
+                {
+                    "adapter_manifest_uri": publication.adapter_manifest_uri,
+                    "report_uri": publication.training_report_uri,
+                    "baseline_predictions_uri": publication.baseline_predictions_uri,
+                    "trained_predictions_uri": publication.trained_predictions_uri,
+                    "publication_manifest_uri": publication.publication_manifest_uri,
+                }
+            )
+            report_uri = publication.training_report_uri
+        else:
+            report_path = write_training_report(report, output_dir)
+            report_uri = report_path.resolve().as_uri()
+            metrics["report_uri"] = report_uri
         try:
             return TrainingResult(
                 artifact=artifact,
                 metrics=metrics,
-                report_uri=report_path.resolve().as_uri(),
+                report_uri=report_uri,
             )
         except TypeError:
             return TrainingResult(artifact=artifact, metrics=metrics)

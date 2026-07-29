@@ -4,6 +4,9 @@ output_dir = "/mnt/d/AI/models/cognityx/training/autotune-5090"
 trial_max_steps = 2
 cooldown_seconds = 5
 
+# Child training runs inherit explicit local publication from the base training
+# configuration. Autotune's capacity artifacts remain controller-owned files.
+
 [telemetry]
 # This WSL instance has Windows executable interop disabled, so retain a clearly
 # labeled WSL live-usage measurement and report motherboard capacity separately.
