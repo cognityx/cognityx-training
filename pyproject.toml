@@ -34,6 +34,9 @@ dev = [
     "pytest>=8.0",
 ]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [tool.uv.sources]
 cognityx-core = { git = "https://github.com/cognityx/cognityx-core.git" }
 cognityx-storage = { git = "https://github.com/cognityx/cognityx-storage.git" }
