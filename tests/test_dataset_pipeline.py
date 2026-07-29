@@ -61,13 +61,13 @@ def _storage_runtime(tmp_path: Path) -> StorageRuntime:
 
 
 def test_dataforge_checksum_matches_real_algorithm() -> None:
-    payload = {
-        "text": "unicode Ω, quote \", backslash \\, newline\n",
-        "nested": {"a": [1, 2, 3]},
-    }
-    assert dataforge_checksum(payload) == hashlib.sha256(
-        json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    records_text = (
+        '{"record_id":"r1","messages":[{"role":"user","content":"Hello Ω"},'
+        '{"role":"assistant","content":"Hi \\"there\\"\\\\"}],"split":"train","metadata":{}}\n'
+        '{"record_id":"r2","messages":[{"role":"user","content":"Line1\\tLine2"},'
+        '{"role":"assistant","content":"CR\\rLF\\n"}],"split":"evaluation","metadata":{"note":"x"}}\n'
+    )
+    assert dataforge_checksum(records_text) == "262068295605a39e1f6dcf5eda645306f691daa83b0dbdd274e156f6023cb346"
     assert normalize_checksum("sha256:abc") == "abc"
 
 
@@ -130,7 +130,11 @@ def test_streaming_reader_and_preflight(tmp_path: Path) -> None:
         {"record_id": "r2", "messages": [{"role": "user", "content": "v"}, {"role": "assistant", "content": "b"}], "split": "evaluation", "metadata": {"evidence_ids": ["e2"]}},
         {"record_id": "r3", "messages": [{"role": "user", "content": "w"}, {"role": "assistant", "content": "c"}], "split": "train", "metadata": {"evidence_ids": ["e3"]}},
     ]
-    records_bytes = b"".join(json.dumps(row, sort_keys=True, ensure_ascii=False).encode("utf-8") + b"\n" for row in records)
+    records_text = "".join(
+        json.dumps(row, sort_keys=True, ensure_ascii=False, separators=(",", ":")) + "\n"
+        for row in records
+    )
+    records_bytes = records_text.encode("utf-8")
     records_obj = dataset_store.put_bytes("demo/1/records.jsonl", records_bytes)
     manifest = {
         "dataset_id": "demo",
@@ -142,7 +146,9 @@ def test_streaming_reader_and_preflight(tmp_path: Path) -> None:
         "source_manifest_checksum": "abc",
         "configuration_checksum": "cfg",
         "records_uri": records_obj.uri,
-        "records_checksum": hashlib.sha256(records_bytes).hexdigest(),
+        "records_checksum": hashlib.sha256(
+            json.dumps(records_text, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
         "accepted_count": 3,
         "train_count": 2,
         "eval_count": 1,
@@ -160,7 +166,8 @@ def test_streaming_reader_and_preflight(tmp_path: Path) -> None:
 def test_checksum_mismatch_fails_before_training(tmp_path: Path) -> None:
     runtime = _storage_runtime(tmp_path)
     dataset_store = runtime.for_role("dataset")
-    records_obj = dataset_store.put_bytes("demo/1/records.jsonl", b'{"instruction":"a","output":"b"}\n')
+    records_text = '{"instruction":"a","output":"b"}\n'
+    records_obj = dataset_store.put_bytes("demo/1/records.jsonl", records_text.encode("utf-8"))
     manifest_obj = dataset_store.put_json(
         "demo/1/manifest.json",
         {
@@ -178,13 +185,11 @@ def test_checksum_mismatch_fails_before_training(tmp_path: Path) -> None:
 def test_unknown_split_fails(tmp_path: Path) -> None:
     runtime = _storage_runtime(tmp_path)
     dataset_store = runtime.for_role("dataset")
-    records_obj = dataset_store.put_bytes(
-        "demo/1/records.jsonl",
-        b'{"record_id":"r1","messages":[{"role":"user","content":"u"},{"role":"assistant","content":"a"}],"split":"mystery"}\n',
-    )
+    records_text = '{"record_id":"r1","messages":[{"role":"user","content":"u"},{"role":"assistant","content":"a"}],"split":"mystery"}\n'
+    records_obj = dataset_store.put_bytes("demo/1/records.jsonl", records_text.encode("utf-8"))
     manifest_obj = dataset_store.put_json(
         "demo/1/manifest.json",
-        {"dataset_id": "demo", "dataset_version": "1", "records_uri": records_obj.uri, "records_checksum": hashlib.sha256(b'{"record_id":"r1","messages":[{"role":"user","content":"u"},{"role":"assistant","content":"a"}],"split":"mystery"}\n').hexdigest()},
+        {"dataset_id": "demo", "dataset_version": "1", "records_uri": records_obj.uri, "records_checksum": dataforge_checksum(records_text)},
     )
     reader = DataForgeDatasetReader(manifest_obj.uri, storage_runtime=runtime, input_mode="dataforge_manifest")
     with pytest.raises(ValueError, match="unsupported split"):

@@ -19,6 +19,7 @@ from cognityx_training.dataset_pipeline import (
     DataForgeDatasetReader,
     collate_supervised_batch,
     encode_supervised_example,
+    iter_selected_training_examples,
     preflight_dataset,
 )
 from cognityx_training.reporting import (
@@ -43,6 +44,23 @@ except ImportError:  # pragma: no cover - imported lazily in normal training pat
 _IterableDatasetBase = torch.utils.data.IterableDataset if torch is not None else object
 
 
+def evaluation_changes(
+    baseline: dict[str, Any],
+    trained: dict[str, Any],
+    evaluation_count: int,
+) -> dict[str, float | None]:
+    if evaluation_count <= 0:
+        return {"exact_match_change": None, "contains_expected_change": None}
+    return {
+        "exact_match_change": (
+            trained["exact_match_accuracy"] - baseline["exact_match_accuracy"]
+        ),
+        "contains_expected_change": (
+            trained["contains_expected_accuracy"] - baseline["contains_expected_accuracy"]
+        ),
+    }
+
+
 class _StreamingTrainingDataset(_IterableDatasetBase):
     def __init__(
         self,
@@ -62,19 +80,15 @@ class _StreamingTrainingDataset(_IterableDatasetBase):
 
     def __iter__(self):
         emitted = 0
-        for record in self.reader.iter_training_records(max_examples=self.max_examples):
-            try:
-                encoded = encode_supervised_example(
-                    self.tokenizer,
-                    record.messages,
-                    max_sequence_length=self.max_sequence_length,
-                )
-            except ValueError:
-                if self.overlength_policy == "skip":
-                    continue
-                raise
+        for selected in iter_selected_training_examples(
+            self.reader,
+            self.tokenizer,
+            max_examples=self.max_examples,
+            max_sequence_length=self.max_sequence_length,
+            overlength_policy=self.overlength_policy,
+        ):
             emitted += 1
-            yield encoded
+            yield {"input_ids": selected.input_ids, "labels": selected.labels}
         if emitted == 0:
             raise ValueError("No trainable examples remain after filtering.")
 
@@ -450,17 +464,10 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
             "evaluation": {
                 "baseline": baseline_evaluation,
                 "trained": trained_evaluation,
-                "exact_match_change": (
-                    trained_evaluation["exact_match_accuracy"]
-                    - baseline_evaluation["exact_match_accuracy"]
-                    if evaluation_records
-                    else None
-                ),
-                "contains_expected_change": (
-                    trained_evaluation["contains_expected_accuracy"]
-                    - baseline_evaluation["contains_expected_accuracy"]
-                    if evaluation_records
-                    else None
+                **evaluation_changes(
+                    baseline_evaluation,
+                    trained_evaluation,
+                    preflight.statistics.evaluation_records,
                 ),
             },
             "adapter_usage": {

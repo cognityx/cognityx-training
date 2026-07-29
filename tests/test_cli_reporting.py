@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from cognityx_training.cli import parse_args
+from cognityx_training.custom_pytorch import evaluation_changes
 from cognityx_training.reporting import (
     ResourceMonitor,
     latency_summary,
@@ -50,3 +51,17 @@ def test_resource_monitor_owns_sampling_methods() -> None:
     assert callable(monitor._run)
     assert callable(monitor._sample)
     assert callable(monitor._safe_io)
+
+
+def test_evaluation_changes_handle_zero_and_nonzero_counts() -> None:
+    baseline = {"exact_match_accuracy": 0.25, "contains_expected_accuracy": 0.5}
+    trained = {"exact_match_accuracy": 0.75, "contains_expected_accuracy": 0.8}
+
+    assert evaluation_changes(baseline, trained, 3) == {
+        "exact_match_change": 0.5,
+        "contains_expected_change": 0.30000000000000004,
+    }
+    assert evaluation_changes(baseline, trained, 0) == {
+        "exact_match_change": None,
+        "contains_expected_change": None,
+    }
