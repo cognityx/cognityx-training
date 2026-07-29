@@ -14,9 +14,10 @@ permissions:
 
 jobs:
   ci:
-    uses: cognityx/.github/.github/workflows/python-package-ci.yml@714d823b96b8608ae4d54705e71325349cfa1f4a
+    uses: cognityx/.github/.github/workflows/python-package-ci.yml@a06694eb0a7e5120890f45f2fc15a837fdf04e27
     with:
       python-version: "3.12"
       run-docs: true
       run-build: true
       run-release-verification: false
+      install-all-extras: true

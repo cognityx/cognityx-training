@@ -98,10 +98,6 @@ class CustomPyTorchTrainingConfig(BackendConfig):
             raise ValueError("host_installed_memory_gib must be positive.")
         if not 0 <= self.lora_dropout < 1:
             raise ValueError("lora_dropout must be between zero and one.")
-        if not self.model_cache_dir.is_dir():
-            raise ValueError(
-                f"Hugging Face model cache does not exist: {self.model_cache_dir}"
-            )
         if self.run_id is not None and (
             not self.run_id or Path(self.run_id).name != self.run_id
         ):
@@ -110,5 +106,9 @@ class CustomPyTorchTrainingConfig(BackendConfig):
             raise ValueError("dataset_input_mode must be auto, dataforge_manifest, or legacy_jsonl.")
         if self.overlength_policy not in {"error", "skip"}:
             raise ValueError("overlength_policy must be error or skip.")
+        if not self.model_cache_dir.is_dir():
+            raise ValueError(
+                f"Hugging Face model cache does not exist: {self.model_cache_dir}"
+            )
         if self.storage_config is not None and not self.storage_config.exists():
             raise ValueError(f"storage_config does not exist: {self.storage_config}")

@@ -173,7 +173,15 @@ def test_capacity_frontier_reports_maximum_success_per_model() -> None:
     assert frontier["by_model"]["14B"]["per_device_train_batch_size"]["value"] == 2
 
 
-def test_example_enables_bounded_model_reuse() -> None:
+def test_example_enables_bounded_model_reuse(monkeypatch) -> None:
+    model_cache = Path("/mnt/d/AI/models/huggingface/hub")
+    original_is_dir = Path.is_dir
+    monkeypatch.setattr(
+        Path,
+        "is_dir",
+        lambda path: path == model_cache or original_is_dir(path),
+    )
+
     config, _values = load_autotune_config(
         Path("examples/autotune-5090/config.toml")
     )
