@@ -22,14 +22,25 @@ class CustomPyTorchTrainingConfig(BackendConfig):
 
     backend: str = "custom-pytorch"
     model_name: str = DEFAULT_MODEL
+    model_revision: str | None = None
+    tokenizer_revision: str | None = None
     model_cache_dir: Path = DEFAULT_HUGGING_FACE_CACHE
     local_files_only: bool = True
     output_dir: Path = Path("/mnt/d/AI/models/cognityx/training/qwen-hello-world")
     run_id: str | None = None
+    training_run_id: str | None = None
+    experiment_id: str | None = None
+    experiment_name: str | None = None
+    experiment_description: str | None = None
+    experiment_created_by: str | None = None
+    experiment_tags: tuple[str, ...] = ()
+    publication_mode: str = "local"
+    retain_local_staging: bool = False
     dataset_input_mode: str = "auto"
     storage_config: Path | None = None
     storage_root: str | Path | None = None
     overlength_policy: str = "error"
+    data_order: str = "source"
     max_sequence_length: int = 512
     max_examples: int | None = None
     max_steps: int = 1
@@ -63,6 +74,8 @@ class CustomPyTorchTrainingConfig(BackendConfig):
                 normalized[path_field] = Path(normalized[path_field])
         if "target_modules" in normalized:
             normalized["target_modules"] = tuple(normalized["target_modules"])
+        if "experiment_tags" in normalized:
+            normalized["experiment_tags"] = tuple(normalized["experiment_tags"])
         for path_field in ("storage_config",):
             if path_field in normalized and normalized[path_field] is not None:
                 normalized[path_field] = Path(normalized[path_field])
@@ -72,6 +85,8 @@ class CustomPyTorchTrainingConfig(BackendConfig):
 
     def validate(self) -> None:
         """Reject invalid values before model allocation begins."""
+        from cognityx_training.lineage import validate_lineage_id
+
         if self.backend != "custom-pytorch":
             raise ValueError("CustomPyTorchTrainingConfig backend must be 'custom-pytorch'.")
         for name in (
@@ -98,14 +113,22 @@ class CustomPyTorchTrainingConfig(BackendConfig):
             raise ValueError("host_installed_memory_gib must be positive.")
         if not 0 <= self.lora_dropout < 1:
             raise ValueError("lora_dropout must be between zero and one.")
-        if self.run_id is not None and (
-            not self.run_id or Path(self.run_id).name != self.run_id
-        ):
-            raise ValueError("run_id must be a non-empty file-name-safe value.")
+        for name in ("run_id", "training_run_id"):
+            value = getattr(self, name)
+            if value is not None and (not value or Path(value).name != value):
+                raise ValueError(f"{name} must be a non-empty file-name-safe value.")
+        if self.run_id is not None and self.training_run_id is not None:
+            raise ValueError("Specify only one of run_id and training_run_id.")
+        if self.publication_mode not in {"storage", "local"}:
+            raise ValueError("publication_mode must be storage or local.")
+        if self.experiment_id is not None:
+            validate_lineage_id(self.experiment_id, prefix="exp-")
         if self.dataset_input_mode not in {"auto", "dataforge_manifest", "legacy_jsonl"}:
             raise ValueError("dataset_input_mode must be auto, dataforge_manifest, or legacy_jsonl.")
         if self.overlength_policy not in {"error", "skip"}:
             raise ValueError("overlength_policy must be error or skip.")
+        if self.data_order != "source":
+            raise ValueError("data_order currently supports only source.")
         if not self.model_cache_dir.is_dir():
             raise ValueError(
                 f"Hugging Face model cache does not exist: {self.model_cache_dir}"

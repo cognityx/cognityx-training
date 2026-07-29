@@ -56,6 +56,16 @@ class PrefixTokenizer:
         return ids
 
 
+class UnsupportedMaskTokenizer(PrefixTokenizer):
+    def apply_chat_template(self, messages, **kwargs):
+        if "return_assistant_tokens_mask" in kwargs:
+            raise TypeError(
+                "apply_chat_template() got an unexpected keyword argument "
+                "'return_assistant_tokens_mask'"
+            )
+        return super().apply_chat_template(messages, **kwargs)
+
+
 def _storage_runtime(tmp_path: Path) -> StorageRuntime:
     return StorageRuntime.from_config(StorageConfig.built_in(root=tmp_path))
 
@@ -107,6 +117,35 @@ def test_prefix_fallback_masks_multi_turn_assistant() -> None:
     assert labels.count(-100) < len(labels)
 
 
+def test_unsupported_assistant_mask_keyword_uses_prefix_fallback() -> None:
+    encoded = encode_supervised_example(
+        UnsupportedMaskTokenizer(),
+        [
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "two"},
+        ],
+    )
+    assert any(label != -100 for label in encoded["labels"])
+
+
+def test_prefix_fallback_rejects_rewritten_prior_tokens() -> None:
+    class RewritingTokenizer(UnsupportedMaskTokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            rendered = super().apply_chat_template(messages, **kwargs)
+            if len(messages) > 1:
+                rendered[0] += 1
+            return rendered
+
+    with pytest.raises(ValueError, match="rewrote previously rendered"):
+        encode_supervised_example(
+            RewritingTokenizer(),
+            [
+                {"role": "user", "content": "one"},
+                {"role": "assistant", "content": "two"},
+            ],
+        )
+
+
 def test_all_zero_or_mismatched_masks_fail() -> None:
     with pytest.raises(ValueError, match="did not mark any target tokens"):
         encode_supervised_example(MaskTokenizer(mask=[0, 0, 0]), [{"role": "assistant", "content": "abc"}])
@@ -120,6 +159,20 @@ def test_all_zero_or_mismatched_masks_fail() -> None:
 
     with pytest.raises(ValueError, match="does not match token length"):
         encode_supervised_example(BadTokenizer(), [{"role": "assistant", "content": "abc"}])
+
+    class PluralMaskTokenizer(MaskTokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            result = super().apply_chat_template(messages, **kwargs)
+            if kwargs.get("return_dict"):
+                result.pop("assistant_tokens_mask", None)
+                result["assistant_masks"] = [0] * len(result["input_ids"])
+            return result
+
+    with pytest.raises(ValueError, match="did not mark any target tokens"):
+        encode_supervised_example(
+            PluralMaskTokenizer(),
+            [{"role": "assistant", "content": "abc"}],
+        )
 
 
 def test_streaming_reader_and_preflight(tmp_path: Path) -> None:

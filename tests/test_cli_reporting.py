@@ -19,6 +19,8 @@ def test_cli_accepts_inspection_and_run_overrides() -> None:
             "outputs",
             "--run-id",
             "smoke-run",
+            "--experiment-id",
+            "exp-smoke",
             "--print-config",
             "--dry-run",
         ]
@@ -27,6 +29,7 @@ def test_cli_accepts_inspection_and_run_overrides() -> None:
     assert args.config == Path("training.toml")
     assert args.output_dir == Path("outputs")
     assert args.run_id == "smoke-run"
+    assert args.experiment_id == "exp-smoke"
     assert args.print_config is True
     assert args.dry_run is True
 

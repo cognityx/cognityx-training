@@ -20,8 +20,12 @@ Use a manifest URI plus storage settings:
 backend = "custom-pytorch"
 dataset_input_mode = "dataforge_manifest"
 storage_config = ".cognityx/storage.toml"
-storage_root = ""
 overlength_policy = "error"
+data_order = "source"
+
+[publication]
+mode = "storage"
+retain_local_staging = false
 
 [dataset]
 name = "example"

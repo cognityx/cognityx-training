@@ -21,8 +21,17 @@ host_telemetry_source = "auto"
 nvidia_smi_path = "nvidia-smi"
 target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
 dataset_input_mode = "dataforge_manifest"
-storage_root = ""
 overlength_policy = "error"
+data_order = "source"
+
+[experiment]
+id = "exp-dataforge-manifest-smoke"
+name = "DataForge manifest smoke training"
+description = "Train and publish a candidate adapter from a versioned DataForge dataset."
+
+[publication]
+mode = "storage"
+retain_local_staging = false
 
 [dataset]
 name = "example-dataforge"
