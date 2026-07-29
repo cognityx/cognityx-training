@@ -1,21 +1,36 @@
-"""Dataset resolution, validation, and token masking for training."""
+"""Dataset resolution, validation, and streaming tokenization for training."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Iterator, Sequence
 from urllib.parse import urlparse
 
+DATASET_INPUT_MODES = {"auto", "dataforge_manifest", "legacy_jsonl"}
+SUPPORTED_SPLITS = {"train", "eval", "evaluation"}
 
-SUPPORTED_INPUT_MODES = {"auto", "dataforge_manifest", "legacy_jsonl"}
+
+def stable_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def dataforge_checksum(value: Any) -> str:
+    return hashlib.sha256(stable_json(value).encode("utf-8")).hexdigest()
+
+
+def normalize_checksum(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return value.removeprefix("sha256:")
 
 
 @dataclass(frozen=True, slots=True)
 class DatasetLineage:
     dataset_id: str | None
+    dataset_name: str | None
     dataset_version: str | None
     dataset_variant_id: str | None
     dataset_manifest_uri: str | None
@@ -25,6 +40,7 @@ class DatasetLineage:
     recipe: str | None
     source_manifest_uri: str | None
     source_manifest_checksum: str | None
+    configuration_checksum: str | None
     split_summary: dict[str, int] = field(default_factory=dict)
     record_counts: dict[str, int] = field(default_factory=dict)
     overlength_policy: str = "error"
@@ -33,21 +49,27 @@ class DatasetLineage:
 
 @dataclass(frozen=True, slots=True)
 class DatasetStatistics:
+    total_records: int
     training_records: int
     evaluation_records: int
-    selected_training_records: int
-    skipped_records: int
+    selected_training_candidates: int
+    accepted_training_examples: int
+    skipped_overlength_examples: int
     maximum_observed_token_length: int | None
+    maximum_accepted_token_length: int | None
     configured_max_sequence_length: int | None
     split_summary: dict[str, int]
-    validation_warnings: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class DatasetPreflightResult:
     lineage: DatasetLineage
     statistics: DatasetStatistics
-    manifest: dict[str, Any] | None = None
+    manifest: dict[str, Any]
+    selected_training_records: tuple[NormalizedRecord, ...] = ()
+    evaluation_records: tuple[NormalizedRecord, ...] = ()
+    skipped_records: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,80 +78,40 @@ class NormalizedRecord:
     messages: tuple[dict[str, str], ...]
     split: str
     metadata: dict[str, Any]
+    line_number: int
     source_uri: str | None = None
-    line_number: int | None = None
-
-
-def stable_checksum(value: Any) -> str:
-    payload = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-    return f"sha256:{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"
 
 
 def _json_object_at_line(text: str, *, source_uri: str | None, line_number: int) -> dict[str, Any]:
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"Invalid JSON at line {line_number} in {source_uri or 'dataset'}"
-        ) from exc
+    value = json.loads(text)
     if not isinstance(value, dict):
         raise ValueError(f"{source_uri or 'dataset'}:{line_number} must contain a JSON object")
     return value
 
 
-def _open_text_stream(store: Any, key: str):
-    handle = store.open(key)
-    return handle
+def _iter_lines(handle: Iterable[bytes | str]) -> Iterator[tuple[int, str]]:
+    for line_number, raw in enumerate(handle, start=1):
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+        if text.strip():
+            yield line_number, text
 
 
-def _unscope_key(store: Any, key: str) -> str:
-    namespace = getattr(store, "namespace", "").strip("/")
-    if namespace and key.startswith(namespace + "/"):
-        return key[len(namespace) + 1 :]
-    return key
-
-
-def resolve_dataset_source(
-    dataset_uri: str,
-    *,
-    storage_runtime: Any | None = None,
-    storage_config: str | Path | None = None,
-    storage_root: str | Path | None = None,
-    input_mode: str = "auto",
-) -> tuple[str, Any | None, dict[str, Any] | None]:
-    mode = input_mode or "auto"
-    if mode not in SUPPORTED_INPUT_MODES:
-        raise ValueError(f"Unsupported dataset input mode: {mode}")
-    parsed = urlparse(dataset_uri)
-    if mode == "auto":
-        mode = "dataforge_manifest" if parsed.scheme == "storage" else "legacy_jsonl"
-    if mode == "legacy_jsonl":
-        if parsed.scheme not in ("", "file"):
-            raise ValueError(f"Legacy JSONL mode only supports local files, got: {dataset_uri}")
-        return "legacy_jsonl", Path(parsed.path if parsed.scheme else dataset_uri).expanduser(), None
-    runtime = storage_runtime
-    if runtime is None:
-        from cognityx_storage import StorageConfig, StorageRuntime
-
-        runtime = (
-            StorageRuntime.load(config_file=storage_config)
-            if storage_config
-            else StorageRuntime.from_config(
-                StorageConfig.built_in(root=storage_root or "/tmp/cognityx-training-storage")
-            )
+def _normalize_split(split: Any, *, record_id: str | None, line_number: int, source_uri: str | None) -> str:
+    value = "train" if split is None else str(split).strip().lower()
+    if not value:
+        value = "train"
+    if value not in SUPPORTED_SPLITS:
+        raise ValueError(
+            f"{source_uri or 'dataset'}:{line_number} record {record_id or '?'} has unsupported split '{split}'"
         )
-    if parsed.scheme != "storage":
-        raise ValueError(f"DataForge manifest mode requires a storage:// URI, got: {dataset_uri}")
-    profile = parsed.netloc
-    key = parsed.path.lstrip("/")
-    store = runtime.for_profile(profile, role_name="dataset")
-    return "dataforge_manifest", store, {"key": key, "runtime": runtime}
+    return "evaluation" if value in {"eval", "evaluation"} else "train"
 
 
 def _normalize_messages(record: dict[str, Any], *, source_uri: str | None, line_number: int) -> tuple[dict[str, str], ...]:
     messages = record.get("messages")
     if isinstance(messages, list) and messages:
         normalized: list[dict[str, str]] = []
+        assistant_count = 0
         for index, message in enumerate(messages, start=1):
             if not isinstance(message, dict):
                 raise ValueError(f"{source_uri or 'dataset'}:{line_number} message {index} must be an object")
@@ -143,8 +125,9 @@ def _normalize_messages(record: dict[str, Any], *, source_uri: str | None, line_
                 raise ValueError(
                     f"{source_uri or 'dataset'}:{line_number} message {index} must have non-empty string content"
                 )
+            assistant_count += int(role == "assistant")
             normalized.append({"role": role, "content": content})
-        if not any(item["role"] == "assistant" for item in normalized):
+        if assistant_count == 0:
             raise ValueError(f"{source_uri or 'dataset'}:{line_number} requires at least one assistant message")
         return tuple(normalized)
     instruction = record.get("instruction") or record.get("prompt")
@@ -159,27 +142,15 @@ def _normalize_messages(record: dict[str, Any], *, source_uri: str | None, line_
     )
 
 
-def _record_metadata(record: dict[str, Any]) -> dict[str, Any]:
-    metadata = dict(record.get("metadata") or {})
-    for key in ("record_id", "knowledge_unit_id", "evidence_ids", "source_asset_ids", "document_ids", "recipe", "split"):
-        if key in record and key not in metadata:
-            metadata[key] = record[key]
-    return metadata
-
-
-def normalize_record(record: dict[str, Any], *, source_uri: str | None = None, line_number: int | None = None) -> NormalizedRecord:
-    split = str(record.get("split", "train")).lower()
-    if split in {"eval", "evaluation"}:
-        split = "evaluation"
-    elif split != "train":
-        split = "train"
+def normalize_record(record: dict[str, Any], *, source_uri: str | None, line_number: int) -> NormalizedRecord:
+    record_id = record.get("record_id")
     return NormalizedRecord(
-        record_id=str(record.get("record_id")) if record.get("record_id") is not None else None,
-        messages=_normalize_messages(record, source_uri=source_uri, line_number=line_number or 0),
-        split=split,
-        metadata=_record_metadata(record),
-        source_uri=source_uri,
+        record_id=str(record_id) if record_id is not None else None,
+        messages=_normalize_messages(record, source_uri=source_uri, line_number=line_number),
+        split=_normalize_split(record.get("split"), record_id=str(record_id) if record_id is not None else None, line_number=line_number, source_uri=source_uri),
+        metadata=dict(record.get("metadata") or {}),
         line_number=line_number,
+        source_uri=source_uri,
     )
 
 
@@ -187,53 +158,84 @@ def messages_for_record(record: dict[str, Any]) -> list[dict[str, str]]:
     return list(_normalize_messages(record, source_uri=None, line_number=0))
 
 
-def legacy_jsonl_records(path: Path) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
+def legacy_jsonl_records(path: Path) -> Iterator[NormalizedRecord]:
     with path.open(encoding="utf-8") as source:
-        for line_number, line in enumerate(source, start=1):
-            if not line.strip():
-                continue
-            records.append(_json_object_at_line(line, source_uri=str(path), line_number=line_number))
-    if not records:
-        raise ValueError(f"Dataset contains no examples: {path}")
-    return records
+        yield from iter_normalized_records(source, source_uri=str(path))
 
 
-def _stream_jsonl_from_store(store: Any, key: str):
-    with _open_text_stream(store, key) as handle:
-        source_uri = store.uri(key) if hasattr(store, "uri") else None
-        for line_number, raw in enumerate(handle, start=1):
-            text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
-            if text.strip():
-                yield line_number, _json_object_at_line(text, source_uri=source_uri, line_number=line_number)
+def iter_normalized_records(handle: Iterable[bytes | str], *, source_uri: str | None) -> Iterator[NormalizedRecord]:
+    for line_number, text in _iter_lines(handle):
+        yield normalize_record(_json_object_at_line(text, source_uri=source_uri, line_number=line_number), source_uri=source_uri, line_number=line_number)
 
 
-def load_manifest(store: Any, key: str) -> tuple[dict[str, Any], str]:
-    with _open_text_stream(store, key) as handle:
+def resolve_dataset_source(
+    dataset_uri: str,
+    *,
+    storage_runtime: Any | None = None,
+    storage_config: str | Path | None = None,
+    storage_root: str | Path | None = None,
+    input_mode: str = "auto",
+) -> tuple[str, Any, dict[str, Any] | None]:
+    if input_mode not in DATASET_INPUT_MODES:
+        raise ValueError(f"Unsupported dataset input mode: {input_mode}")
+    parsed = urlparse(dataset_uri)
+    mode = input_mode if input_mode != "auto" else ("dataforge_manifest" if parsed.scheme == "storage" else "legacy_jsonl")
+    if mode == "legacy_jsonl":
+        if parsed.scheme not in {"", "file"}:
+            raise ValueError(f"Legacy JSONL mode only supports local files, got: {dataset_uri}")
+        return mode, Path(parsed.path if parsed.scheme else dataset_uri).expanduser(), None
+    if parsed.scheme != "storage":
+        raise ValueError(f"DataForge manifest mode requires a storage:// URI, got: {dataset_uri}")
+    runtime = storage_runtime
+    if runtime is None:
+        from cognityx_storage import StorageConfig, StorageRuntime
+        runtime = StorageRuntime.load(config_file=storage_config) if storage_config else StorageRuntime.from_config(StorageConfig.built_in(root=storage_root or "/tmp/cognityx-training-storage"))
+    store = runtime.for_profile(parsed.netloc, role_name="dataset")
+    return mode, store, {"runtime": runtime, "key": parsed.path.lstrip("/")}
+
+
+def _split_manifest_fields(manifest: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "dataset_id": manifest.get("dataset_id"),
+        "dataset_name": manifest.get("dataset_name"),
+        "dataset_version": manifest.get("dataset_version"),
+        "dataset_variant_id": manifest.get("dataset_variant_id"),
+        "dataset_manifest_uri": manifest.get("dataset_manifest_uri"),
+        "dataset_manifest_checksum": normalize_checksum(manifest.get("dataset_manifest_checksum")),
+        "records_uri": manifest.get("records_uri"),
+        "records_checksum": normalize_checksum(manifest.get("records_checksum")),
+        "recipe": manifest.get("recipe"),
+        "source_manifest_uri": manifest.get("source_manifest_uri"),
+        "source_manifest_checksum": normalize_checksum(manifest.get("source_manifest_checksum")),
+        "configuration_checksum": normalize_checksum(manifest.get("configuration_checksum")),
+        "split_summary": dict(manifest.get("split_summary") or {}),
+        "record_counts": dict(manifest.get("record_counts") or {}),
+        "overlength_policy": str(manifest.get("overlength_policy", "error")),
+        "skipped_records": list(manifest.get("skipped_records") or []),
+    }
+
+
+def _load_json_object(store: Any, key: str) -> dict[str, Any]:
+    namespace = getattr(store, "namespace", "").strip("/")
+    if namespace and key.startswith(namespace + "/"):
+        key = key[len(namespace) + 1 :]
+    with store.open(key) as handle:
         manifest = json.load(handle)
     if not isinstance(manifest, dict):
         raise ValueError("Dataset manifest must be a JSON object")
-    manifest_checksum = stable_checksum(manifest)
-    return manifest, manifest_checksum
+    return manifest
 
 
-def _lineage_from_manifest(manifest_uri: str, manifest: dict[str, Any], manifest_checksum: str) -> DatasetLineage:
-    return DatasetLineage(
-        dataset_id=manifest.get("dataset_id"),
-        dataset_version=manifest.get("dataset_version"),
-        dataset_variant_id=manifest.get("dataset_variant_id"),
-        dataset_manifest_uri=manifest_uri,
-        dataset_manifest_checksum=manifest_checksum,
-        records_uri=manifest.get("records_uri"),
-        records_checksum=manifest.get("records_checksum"),
-        recipe=manifest.get("recipe"),
-        source_manifest_uri=manifest.get("source_manifest_uri"),
-        source_manifest_checksum=manifest.get("source_manifest_checksum"),
-        split_summary=dict(manifest.get("split_summary", {})),
-        record_counts=dict(manifest.get("record_counts", {})),
-        overlength_policy=str(manifest.get("overlength_policy", "error")),
-        skipped_records=list(manifest.get("skipped_records", [])),
-    )
+def _records_key_from_uri(records_uri: str, runtime: Any) -> tuple[Any, str]:
+    parsed = urlparse(records_uri)
+    if parsed.scheme != "storage":
+        raise ValueError(f"Records URI must be storage://, got: {records_uri}")
+    store = runtime.for_profile(parsed.netloc, role_name="dataset")
+    key = parsed.path.lstrip("/")
+    namespace = getattr(store, "namespace", "").strip("/")
+    if namespace and key.startswith(namespace + "/"):
+        key = key[len(namespace) + 1 :]
+    return store, key
 
 
 class DataForgeDatasetReader:
@@ -261,51 +263,81 @@ class DataForgeDatasetReader:
         if self.mode != "dataforge_manifest":
             raise ValueError("Legacy JSONL datasets do not have a DataForge manifest")
         assert self._source is not None and self._context is not None
-        key = _unscope_key(self._source, self._context["key"])
-        manifest, manifest_checksum = load_manifest(self._source, key)
-        if manifest.get("records_uri") is None or manifest.get("records_checksum") is None:
-            raise ValueError(f"Malformed DataForge manifest at {self.dataset_uri}")
-        if manifest.get("dataset_manifest_uri") and manifest["dataset_manifest_uri"] != self.dataset_uri:
-            manifest = dict(manifest)
-            manifest["dataset_manifest_uri"] = self.dataset_uri
+        manifest = _load_json_object(self._source, self._context["key"])
+        checksum = dataforge_checksum(manifest)
         self._manifest = manifest
-        self._manifest_checksum = manifest_checksum
-        return manifest, manifest_checksum
+        self._manifest_checksum = checksum
+        return manifest, checksum
+
+    def manifest(self) -> dict[str, Any]:
+        return self._manifest or self._load_manifest()[0]
 
     def lineage(self) -> DatasetLineage:
         if self.mode == "legacy_jsonl":
-            return DatasetLineage(None, None, None, self.dataset_uri, None, self.dataset_uri, None, None, None, None)
-        manifest, manifest_checksum = self._manifest or self._load_manifest()
-        return _lineage_from_manifest(self.dataset_uri, manifest, manifest_checksum)
+            return DatasetLineage(
+                dataset_id=None,
+                dataset_name=None,
+                dataset_version=None,
+                dataset_variant_id=None,
+                dataset_manifest_uri=self.dataset_uri,
+                dataset_manifest_checksum=None,
+                records_uri=self.dataset_uri,
+                records_checksum=None,
+                recipe=None,
+                source_manifest_uri=None,
+                source_manifest_checksum=None,
+                configuration_checksum=None,
+            )
+        manifest = self.manifest()
+        fields = _split_manifest_fields(manifest)
+        manifest_uri = self.dataset_uri if fields["dataset_manifest_uri"] is None else fields["dataset_manifest_uri"]
+        return DatasetLineage(
+            dataset_id=fields["dataset_id"],
+            dataset_name=fields["dataset_name"],
+            dataset_version=fields["dataset_version"],
+            dataset_variant_id=fields["dataset_variant_id"],
+            dataset_manifest_uri=manifest_uri,
+            dataset_manifest_checksum=self._manifest_checksum or dataforge_checksum(manifest),
+            records_uri=fields["records_uri"],
+            records_checksum=fields["records_checksum"],
+            recipe=fields["recipe"],
+            source_manifest_uri=fields["source_manifest_uri"],
+            source_manifest_checksum=fields["source_manifest_checksum"],
+            configuration_checksum=fields["configuration_checksum"],
+            split_summary=fields["split_summary"],
+            record_counts=fields["record_counts"],
+            overlength_policy=fields["overlength_policy"],
+            skipped_records=fields["skipped_records"],
+        )
 
-    def iter_records(self):
+    def iter_records(self) -> Iterator[NormalizedRecord]:
         if self.mode == "legacy_jsonl":
             assert isinstance(self._source, Path)
-            for line_number, record in enumerate(legacy_jsonl_records(self._source), start=1):
-                yield normalize_record(record, source_uri=str(self._source), line_number=line_number)
+            yield from legacy_jsonl_records(self._source)
             return
-        assert self._source is not None
-        manifest = self._manifest or self._load_manifest()[0]
+        manifest = self.manifest()
+        assert self._context is not None
         records_uri = manifest["records_uri"]
-        parsed = urlparse(records_uri)
-        if parsed.scheme != "storage":
-            raise ValueError(f"Records URI must be storage://, got: {records_uri}")
-        store = self._context["runtime"].for_profile(parsed.netloc, role_name="dataset")
-        key = _unscope_key(store, parsed.path.lstrip("/"))
+        if normalize_checksum(manifest.get("records_checksum")) is None:
+            raise ValueError(f"Malformed DataForge manifest at {self.dataset_uri}")
+        runtime = self._context["runtime"]
+        store, key = _records_key_from_uri(records_uri, runtime)
+        hasher = hashlib.sha256()
         with store.open(key) as handle:
-            raw = handle.read()
-        if stable_checksum(raw.decode("utf-8")) != manifest["records_checksum"]:
+            for line_number, raw in enumerate(handle, start=1):
+                text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+                hasher.update(text.encode("utf-8"))
+        if hasher.hexdigest() != normalize_checksum(manifest["records_checksum"]):
             raise ValueError(f"Records checksum mismatch for {records_uri}")
-        for line_number, line in enumerate(raw.decode("utf-8").splitlines(), start=1):
-            if not line.strip():
-                continue
-            yield normalize_record(
-                _json_object_at_line(line, source_uri=records_uri, line_number=line_number),
-                source_uri=records_uri,
-                line_number=line_number,
-            )
+        with store.open(key) as handle:
+            for line_number, text in _iter_lines(handle):
+                yield normalize_record(
+                    _json_object_at_line(text, source_uri=records_uri, line_number=line_number),
+                    source_uri=records_uri,
+                    line_number=line_number,
+                )
 
-    def iter_training_records(self, *, max_examples: int | None = None):
+    def iter_training_records(self, *, max_examples: int | None = None) -> Iterator[NormalizedRecord]:
         count = 0
         for record in self.iter_records():
             if record.split == "evaluation":
@@ -315,74 +347,104 @@ class DataForgeDatasetReader:
             count += 1
             yield record
 
-    def iter_evaluation_records(self):
+    def iter_evaluation_records(self) -> Iterator[NormalizedRecord]:
         for record in self.iter_records():
             if record.split == "evaluation":
                 yield record
 
     def statistics(self, *, max_examples: int | None = None) -> DatasetStatistics:
-        training = evaluation = selected = skipped = 0
+        total = training = evaluation = 0
         split_summary: dict[str, int] = {}
-        max_tokens: int | None = None
         for record in self.iter_records():
+            total += 1
             split_summary[record.split] = split_summary.get(record.split, 0) + 1
             if record.split == "evaluation":
                 evaluation += 1
             else:
                 training += 1
         selected = min(training, max_examples) if max_examples is not None else training
-        lineage = self.lineage()
-        return DatasetStatistics(training, evaluation, selected, skipped, max_tokens, None, split_summary, ())
+        return DatasetStatistics(
+            total_records=total,
+            training_records=training,
+            evaluation_records=evaluation,
+            selected_training_candidates=selected,
+            accepted_training_examples=selected,
+            skipped_overlength_examples=0,
+            maximum_observed_token_length=None,
+            maximum_accepted_token_length=None,
+            configured_max_sequence_length=None,
+            split_summary=split_summary,
+        )
 
 
-def _assistant_token_mask(tokenizer: Any, messages: Sequence[dict[str, str]]) -> tuple[list[int], list[int]]:
-    try:
+def _assistant_mask_from_template(tokenizer: Any, messages: Sequence[dict[str, str]]) -> tuple[list[int], list[int]]:
+    rendered = tokenizer.apply_chat_template(
+        list(messages),
+        tokenize=True,
+        add_generation_prompt=False,
+        return_dict=True,
+        return_assistant_tokens_mask=True,
+    )
+    input_ids = rendered.get("input_ids")
+    mask = rendered.get("assistant_tokens_mask") or rendered.get("assistant_mask")
+    if input_ids is None or mask is None:
+        raise LookupError("Tokenizer did not provide assistant token mask")
+    if len(input_ids) != len(mask):
+        raise ValueError("Assistant mask length does not match token length")
+    labels = [token if bool(flag) else -100 for token, flag in zip(input_ids, mask)]
+    if all(label == -100 for label in labels):
+        raise ValueError("Assistant mask did not mark any target tokens")
+    return list(input_ids), labels
+
+
+def _fallback_mask_from_prefixes(tokenizer: Any, messages: Sequence[dict[str, str]]) -> tuple[list[int], list[int]]:
+    prefixes: list[dict[str, str]] = []
+    input_ids: list[int] = []
+    labels: list[int] = []
+    assistant_tokens = 0
+    for index, message in enumerate(messages):
+        prefixes.append(message)
         rendered = tokenizer.apply_chat_template(
-            list(messages),
+            list(prefixes),
             tokenize=True,
             add_generation_prompt=False,
-            return_tensors=None,
-            return_dict=True,
-            return_assistant_tokens_mask=True,
+            return_dict=False,
         )
-        input_ids = list(rendered["input_ids"])
-        mask = list(rendered["assistant_tokens_mask"])
-        return input_ids, mask
-    except Exception:
-        input_ids: list[int] = []
-        labels: list[int] = []
-        for message in messages:
-            encoded = tokenizer(
-                message["content"],
-                add_special_tokens=True,
-                return_attention_mask=False,
-            )["input_ids"]
-            if message["role"] == "assistant":
-                input_ids.extend(encoded)
-                labels.extend(encoded)
-            else:
-                input_ids.extend(encoded)
-                labels.extend([-100] * len(encoded))
-        return input_ids, labels
+        if not isinstance(rendered, (list, tuple)):
+            raise ValueError("Tokenizer chat template fallback must return token ids")
+        rendered_ids = list(rendered)
+        if index == 0:
+            input_ids = rendered_ids
+            labels = [-100] * len(rendered_ids)
+            continue
+        if len(rendered_ids) < len(input_ids):
+            raise ValueError("Tokenizer fallback produced non-monotonic chat template length")
+        new_tokens = rendered_ids[len(input_ids) :]
+        input_ids = rendered_ids
+        if message["role"] == "assistant":
+            labels.extend(new_tokens)
+            assistant_tokens += len(new_tokens)
+        else:
+            labels.extend([-100] * len(new_tokens))
+    if assistant_tokens == 0:
+        raise ValueError("Assistant boundaries could not be determined safely")
+    if len(input_ids) != len(labels):
+        raise ValueError("Assistant mask length does not match token length")
+    return input_ids, labels
 
 
-def encode_supervised_example(tokenizer: Any, messages: Sequence[dict[str, str]], *, max_sequence_length: int | None = None) -> dict[str, list[int]]:
+def encode_supervised_example(
+    tokenizer: Any,
+    messages: Sequence[dict[str, str]],
+    *,
+    max_sequence_length: int | None = None,
+) -> dict[str, Any]:
     try:
-        rendered = tokenizer.apply_chat_template(
-            list(messages),
-            tokenize=True,
-            add_generation_prompt=False,
-            return_tensors=None,
-            return_dict=True,
-            return_assistant_tokens_mask=True,
-        )
-        input_ids = list(rendered["input_ids"])
-        mask = rendered.get("assistant_tokens_mask") or rendered.get("assistant_mask")
-        if mask is None:
-            raise KeyError
-        labels = [token if bool(flag) else -100 for token, flag in zip(input_ids, mask)]
+        input_ids, labels = _assistant_mask_from_template(tokenizer, messages)
+    except LookupError:
+        input_ids, labels = _fallback_mask_from_prefixes(tokenizer, messages)
     except Exception:
-        input_ids, labels = _assistant_token_mask(tokenizer, messages)
+        raise
     if max_sequence_length is not None and len(input_ids) > max_sequence_length:
         raise ValueError(
             f"Example exceeds maximum sequence length: {len(input_ids)} > {max_sequence_length}"
@@ -390,24 +452,18 @@ def encode_supervised_example(tokenizer: Any, messages: Sequence[dict[str, str]]
     return {"input_ids": input_ids, "labels": labels}
 
 
-def collate_supervised_batch(
-    batch: Sequence[dict[str, list[int]]],
-    *,
-    pad_token_id: int,
-    max_sequence_length: int | None = None,
-):
+def collate_supervised_batch(batch: Sequence[dict[str, Any]], *, pad_token_id: int) -> dict[str, Any]:
     import torch
 
     longest = max(len(item["input_ids"]) for item in batch)
-    if max_sequence_length is not None:
-        longest = min(longest, max_sequence_length)
     input_ids = []
     attention_masks = []
     labels = []
     for item in batch:
-        ids = item["input_ids"][:longest]
-        lab = item["labels"][:longest]
+        ids = list(item["input_ids"])
+        lab = list(item["labels"])
         pad = longest - len(ids)
+        assert pad >= 0
         input_ids.append(ids + [pad_token_id] * pad)
         attention_masks.append([1] * len(ids) + [0] * pad)
         labels.append(lab + [-100] * pad)
@@ -416,3 +472,94 @@ def collate_supervised_batch(
         "attention_mask": torch.tensor(attention_masks, dtype=torch.long),
         "labels": torch.tensor(labels, dtype=torch.long),
     }
+
+
+def preflight_dataset(
+    reader: DataForgeDatasetReader,
+    tokenizer: Any,
+    *,
+    max_examples: int | None,
+    max_sequence_length: int,
+    overlength_policy: str,
+) -> DatasetPreflightResult:
+    manifest = reader.manifest() if reader.mode == "dataforge_manifest" else {}
+    lineage = reader.lineage()
+    manifest_train = manifest.get("train_count")
+    manifest_eval = manifest.get("eval_count")
+    manifest_accepted = manifest.get("accepted_count")
+    selected: list[NormalizedRecord] = []
+    evaluations: list[NormalizedRecord] = []
+    skipped: list[dict[str, Any]] = []
+    total = training = evaluation = 0
+    max_observed: int | None = None
+    max_accepted: int | None = None
+    for record in reader.iter_records():
+        total += 1
+        if record.split == "evaluation":
+            evaluation += 1
+            evaluations.append(record)
+            continue
+        training += 1
+        tokenized = encode_supervised_example(tokenizer, record.messages)
+        length = len(tokenized["input_ids"])
+        max_observed = length if max_observed is None else max(max_observed, length)
+        if length > max_sequence_length:
+            skipped_record = {
+                "record_id": record.record_id,
+                "line_number": record.line_number,
+                "actual_token_count": length,
+                "maximum_sequence_length": max_sequence_length,
+                "dataset_manifest_uri": lineage.dataset_manifest_uri,
+                "records_uri": lineage.records_uri,
+                "reason": "overlength",
+            }
+            if overlength_policy == "skip":
+                skipped.append(skipped_record)
+                continue
+            raise ValueError(
+                f"Record {record.record_id or record.line_number} at line {record.line_number} in {lineage.records_uri} exceeds maximum sequence length {max_sequence_length}; "
+                f"manifest {lineage.dataset_manifest_uri}. Suggest increasing max_sequence_length or using overlength_policy=skip."
+            )
+        if max_examples is None or len(selected) < max_examples:
+            selected.append(record)
+            max_accepted = length if max_accepted is None else max(max_accepted, length)
+        stats = DatasetStatistics(
+        total_records=total,
+        training_records=training,
+        evaluation_records=evaluation,
+        selected_training_candidates=min(training, max_examples) if max_examples is not None else training,
+        accepted_training_examples=len(selected),
+        skipped_overlength_examples=len(skipped),
+        maximum_observed_token_length=max_observed,
+        maximum_accepted_token_length=max_accepted,
+        configured_max_sequence_length=max_sequence_length,
+        split_summary={"train": training, "evaluation": evaluation},
+        warnings=(),
+    )
+    if manifest_train is not None and int(manifest_train) != training:
+        raise ValueError(
+            f"Manifest train_count {manifest_train} disagrees with streamed training records {training}."
+        )
+    if manifest_eval is not None and int(manifest_eval) != evaluation:
+        raise ValueError(
+            f"Manifest eval_count {manifest_eval} disagrees with streamed evaluation records {evaluation}."
+        )
+    if manifest_accepted is not None and int(manifest_accepted) < len(selected):
+        raise ValueError(
+            f"Manifest accepted_count {manifest_accepted} is smaller than accepted training examples {len(selected)}."
+        )
+    if stats.accepted_training_examples == 0:
+        raise ValueError(
+            f"No trainable examples remain after applying max_examples={max_examples} and overlength_policy={overlength_policy}."
+        )
+    lineage_payload = asdict(lineage)
+    lineage_payload["overlength_policy"] = overlength_policy
+    lineage_payload["skipped_records"] = list(skipped)
+    return DatasetPreflightResult(
+        lineage=DatasetLineage(**lineage_payload),
+        statistics=stats,
+        manifest=manifest,
+        selected_training_records=tuple(selected),
+        evaluation_records=tuple(evaluations),
+        skipped_records=tuple(skipped),
+    )

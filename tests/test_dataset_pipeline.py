@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -9,45 +10,77 @@ from cognityx_storage import StorageConfig, StorageRuntime
 from cognityx_training.dataset_pipeline import (
     DataForgeDatasetReader,
     collate_supervised_batch,
+    dataforge_checksum,
     encode_supervised_example,
     legacy_jsonl_records,
-    messages_for_record,
+    normalize_checksum,
+    preflight_dataset,
 )
 
 
-class FakeTokenizer:
+class MaskTokenizer:
     pad_token_id = 0
 
-    def __call__(self, text, **_kwargs):
-        return {"input_ids": [ord(ch) % 10 + 1 for ch in text]}
+    def __init__(self, mask: list[int] | None = None, template_mode: str = "mask") -> None:
+        self.mask = mask
+        self.template_mode = template_mode
 
     def apply_chat_template(self, messages, **kwargs):
         ids = []
         mask = []
         for message in messages:
-            token_ids = [ord(ch) % 10 + 1 for ch in message["content"]]
+            token_ids = [ord(ch) % 13 + 1 for ch in message["content"]]
             ids.extend(token_ids)
-            mask.extend([1 if message["role"] == "assistant" else 0] * len(token_ids))
+            if self.template_mode == "prefix":
+                mask.extend([1 if message["role"] == "assistant" else 0] * len(token_ids))
+            else:
+                mask.extend([1 if message["role"] == "assistant" else 0] * len(token_ids))
+        if self.mask is not None:
+            mask = list(self.mask)
         if kwargs.get("return_dict"):
-            return {"input_ids": ids, "assistant_tokens_mask": mask}
+            result = {"input_ids": ids}
+            if kwargs.get("return_assistant_tokens_mask"):
+                result["assistant_tokens_mask"] = mask
+            return result
         return ids
+
+
+class PrefixTokenizer:
+    pad_token_id = 0
+
+    def apply_chat_template(self, messages, **kwargs):
+        text = "|".join(f"{item['role']}:{item['content']}" for item in messages)
+        ids = [ord(ch) % 17 + 1 for ch in text]
+        if kwargs.get("return_dict"):
+            return {"input_ids": ids}
+        return ids
+
+
+def _storage_runtime(tmp_path: Path) -> StorageRuntime:
+    return StorageRuntime.from_config(StorageConfig.built_in(root=tmp_path))
+
+
+def test_dataforge_checksum_matches_real_algorithm() -> None:
+    payload = {
+        "text": "unicode Ω, quote \", backslash \\, newline\n",
+        "nested": {"a": [1, 2, 3]},
+    }
+    assert dataforge_checksum(payload) == hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    assert normalize_checksum("sha256:abc") == "abc"
 
 
 def test_legacy_jsonl_compatibility(tmp_path: Path) -> None:
     path = tmp_path / "train.jsonl"
-    path.write_text(
-        json.dumps({"instruction": "Say hello", "output": "Hello!"}) + "\n",
-        encoding="utf-8",
-    )
-
-    records = legacy_jsonl_records(path)
-    assert records[0]["instruction"] == "Say hello"
-    assert messages_for_record(records[0])[1]["content"] == "Hello!"
+    path.write_text(json.dumps({"instruction": "Say hello", "output": "Hello!"}) + "\n", encoding="utf-8")
+    records = list(legacy_jsonl_records(path))
+    assert records[0].messages[1]["content"] == "Hello!"
 
 
-def test_assistant_only_labels_and_padding() -> None:
+def test_assistant_masking_and_collation() -> None:
     encoded = encode_supervised_example(
-        FakeTokenizer(),
+        MaskTokenizer(),
         [
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "hi"},
@@ -55,43 +88,77 @@ def test_assistant_only_labels_and_padding() -> None:
         ],
     )
     batch = collate_supervised_batch([encoded], pad_token_id=0)
-    labels = batch["labels"][0].tolist()
+    assert any(label != -100 for label in batch["labels"][0].tolist())
+    assert batch["labels"][0].tolist()[:5].count(-100) >= 3
+
+
+def test_prefix_fallback_masks_multi_turn_assistant() -> None:
+    encoded = encode_supervised_example(
+        PrefixTokenizer(),
+        [
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "two"},
+            {"role": "user", "content": "three"},
+            {"role": "assistant", "content": "four"},
+        ],
+    )
+    labels = encoded["labels"]
     assert any(label != -100 for label in labels)
-    assert labels[:3] == [-100, -100, -100]
+    assert labels.count(-100) < len(labels)
 
 
-def test_dataforge_manifest_reader_streams_and_checksums(tmp_path: Path) -> None:
-    runtime = StorageRuntime.from_config(StorageConfig.built_in(root=tmp_path))
+def test_all_zero_or_mismatched_masks_fail() -> None:
+    with pytest.raises(ValueError, match="did not mark any target tokens"):
+        encode_supervised_example(MaskTokenizer(mask=[0, 0, 0]), [{"role": "assistant", "content": "abc"}])
+
+    class BadTokenizer(MaskTokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            result = super().apply_chat_template(messages, **kwargs)
+            if kwargs.get("return_dict"):
+                result["assistant_tokens_mask"] = [1]
+            return result
+
+    with pytest.raises(ValueError, match="does not match token length"):
+        encode_supervised_example(BadTokenizer(), [{"role": "assistant", "content": "abc"}])
+
+
+def test_streaming_reader_and_preflight(tmp_path: Path) -> None:
+    runtime = _storage_runtime(tmp_path)
     dataset_store = runtime.for_role("dataset")
     records = [
         {"record_id": "r1", "messages": [{"role": "user", "content": "u"}, {"role": "assistant", "content": "a"}], "split": "train", "metadata": {"evidence_ids": ["e1"]}},
-        {"record_id": "r2", "messages": [{"role": "user", "content": "q"}, {"role": "assistant", "content": "r"}], "split": "evaluation", "metadata": {"evidence_ids": ["e2"]}},
+        {"record_id": "r2", "messages": [{"role": "user", "content": "v"}, {"role": "assistant", "content": "b"}], "split": "evaluation", "metadata": {"evidence_ids": ["e2"]}},
+        {"record_id": "r3", "messages": [{"role": "user", "content": "w"}, {"role": "assistant", "content": "c"}], "split": "train", "metadata": {"evidence_ids": ["e3"]}},
     ]
-    records_bytes = b"".join(json.dumps(row).encode() + b"\n" for row in records)
+    records_bytes = b"".join(json.dumps(row, sort_keys=True, ensure_ascii=False).encode("utf-8") + b"\n" for row in records)
     records_obj = dataset_store.put_bytes("demo/1/records.jsonl", records_bytes)
     manifest = {
         "dataset_id": "demo",
+        "dataset_name": "demo-name",
         "dataset_version": "1",
-        "records_uri": records_obj.uri,
-        "records_checksum": "sha256:" + __import__("hashlib").sha256(json.dumps(records_bytes.decode("utf-8")).encode("utf-8")).hexdigest(),
+        "schema_version": "cognityx.dataforge.dataset/v1",
         "recipe": "paragraph-qa",
         "source_manifest_uri": "storage://local-main/ingest/runs/r1/manifest.json",
-        "source_manifest_checksum": "sha256:abc",
-        "split_summary": {"train": 1, "evaluation": 1},
-        "record_counts": {"train": 1, "evaluation": 1},
-        "overlength_policy": "error",
+        "source_manifest_checksum": "abc",
+        "configuration_checksum": "cfg",
+        "records_uri": records_obj.uri,
+        "records_checksum": hashlib.sha256(records_bytes).hexdigest(),
+        "accepted_count": 3,
+        "train_count": 2,
+        "eval_count": 1,
     }
     manifest_obj = dataset_store.put_json("demo/1/manifest.json", manifest)
-
     reader = DataForgeDatasetReader(manifest_obj.uri, storage_runtime=runtime, input_mode="dataforge_manifest")
-    lineage = reader.lineage()
-    assert lineage.dataset_id == "demo"
-    assert list(reader.iter_training_records())[0].record_id == "r1"
-    assert list(reader.iter_evaluation_records())[0].record_id == "r2"
+    assert [record.record_id for record in reader.iter_training_records()] == ["r1", "r3"]
+    assert [record.record_id for record in reader.iter_evaluation_records()] == ["r2"]
+    preflight = preflight_dataset(reader, MaskTokenizer(), max_examples=1, max_sequence_length=32, overlength_policy="error")
+    assert preflight.statistics.total_records == 3
+    assert preflight.statistics.accepted_training_examples == 1
+    assert preflight.lineage.dataset_name == "demo-name"
 
 
-def test_records_checksum_mismatch_fails(tmp_path: Path) -> None:
-    runtime = StorageRuntime.from_config(StorageConfig.built_in(root=tmp_path))
+def test_checksum_mismatch_fails_before_training(tmp_path: Path) -> None:
+    runtime = _storage_runtime(tmp_path)
     dataset_store = runtime.for_role("dataset")
     records_obj = dataset_store.put_bytes("demo/1/records.jsonl", b'{"instruction":"a","output":"b"}\n')
     manifest_obj = dataset_store.put_json(
@@ -100,9 +167,25 @@ def test_records_checksum_mismatch_fails(tmp_path: Path) -> None:
             "dataset_id": "demo",
             "dataset_version": "1",
             "records_uri": records_obj.uri,
-            "records_checksum": "sha256:bad",
+            "records_checksum": "deadbeef",
         },
     )
     reader = DataForgeDatasetReader(manifest_obj.uri, storage_runtime=runtime, input_mode="dataforge_manifest")
     with pytest.raises(ValueError, match="checksum mismatch"):
+        list(reader.iter_records())
+
+
+def test_unknown_split_fails(tmp_path: Path) -> None:
+    runtime = _storage_runtime(tmp_path)
+    dataset_store = runtime.for_role("dataset")
+    records_obj = dataset_store.put_bytes(
+        "demo/1/records.jsonl",
+        b'{"record_id":"r1","messages":[{"role":"user","content":"u"},{"role":"assistant","content":"a"}],"split":"mystery"}\n',
+    )
+    manifest_obj = dataset_store.put_json(
+        "demo/1/manifest.json",
+        {"dataset_id": "demo", "dataset_version": "1", "records_uri": records_obj.uri, "records_checksum": hashlib.sha256(b'{"record_id":"r1","messages":[{"role":"user","content":"u"},{"role":"assistant","content":"a"}],"split":"mystery"}\n').hexdigest()},
+    )
+    reader = DataForgeDatasetReader(manifest_obj.uri, storage_runtime=runtime, input_mode="dataforge_manifest")
+    with pytest.raises(ValueError, match="unsupported split"):
         list(reader.iter_records())

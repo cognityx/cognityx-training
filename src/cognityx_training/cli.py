@@ -84,7 +84,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.print_config:
         print(json.dumps(jsonable_configuration(config), indent=2, sort_keys=True))
     if args.dry_run:
-        from cognityx_training.dataset_pipeline import DataForgeDatasetReader
+        from cognityx_training.dataset_pipeline import DataForgeDatasetReader, preflight_dataset
 
         reader = DataForgeDatasetReader(
             dataset.uri,
@@ -92,16 +92,31 @@ def main(argv: list[str] | None = None) -> None:
             storage_root=config.storage_root,
             input_mode=config.dataset_input_mode,
         )
-        lineage = reader.lineage()
-        stats = reader.statistics(max_examples=config.max_examples)
+        tokenizer = None
+        if config.model_name:
+            from transformers import AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                config.model_name,
+                cache_dir=str(config.model_cache_dir),
+                local_files_only=config.local_files_only,
+            )
+            if tokenizer.pad_token_id is None:
+                tokenizer.pad_token = tokenizer.eos_token
+        preflight = preflight_dataset(
+            reader,
+            tokenizer,
+            max_examples=config.max_examples,
+            max_sequence_length=config.max_sequence_length,
+            overlength_policy=config.overlength_policy,
+        )
         effective_batch_size = (
             config.per_device_train_batch_size * config.gradient_accumulation_steps
         )
         print(
-            "Configuration valid. "
-            f"Dataset lineage: {json.dumps(asdict(lineage), sort_keys=True, default=str)}. "
-            f"Dataset records: {stats.training_records + stats.evaluation_records} total, "
-            f"{stats.selected_training_records} training, {stats.evaluation_records} evaluation. "
+            f"Dataset lineage: {json.dumps(asdict(preflight.lineage), sort_keys=True, default=str)}. "
+            f"Dataset records: {preflight.statistics.total_records} total, "
+            f"{preflight.statistics.accepted_training_examples} training, {preflight.statistics.evaluation_records} evaluation. "
             f"Micro batch: {config.per_device_train_batch_size}; "
             f"effective batch: {effective_batch_size}; "
             f"optimizer steps: {config.max_steps}."
