@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 
 DATASET_INPUT_MODES = {"auto", "dataforge_manifest", "legacy_jsonl"}
 SUPPORTED_SPLITS = {"train", "eval", "evaluation"}
+DEFAULT_SKIPPED_SAMPLE_LIMIT = 10
 
 
 def stable_json(value: Any) -> str:
@@ -25,6 +26,16 @@ def normalize_checksum(value: str | None) -> str | None:
     if value is None:
         return None
     return value.removeprefix("sha256:")
+
+
+def incremental_dataforge_checksum(handle: Iterable[bytes | str]) -> str:
+    hasher = hashlib.sha256()
+    hasher.update(b'"')
+    for chunk in handle:
+        text = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
+        hasher.update(json.dumps(text, ensure_ascii=False)[1:-1].encode("utf-8"))
+    hasher.update(b'"')
+    return hasher.hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,11 +65,13 @@ class DatasetStatistics:
     evaluation_records: int
     selected_training_candidates: int
     accepted_training_examples: int
-    skipped_overlength_examples: int
+    skipped_overlength_count: int
     maximum_observed_token_length: int | None
     maximum_accepted_token_length: int | None
     configured_max_sequence_length: int | None
     split_summary: dict[str, int]
+    skipped_record_samples: tuple[dict[str, Any], ...] = ()
+    skipped_record_sample_limit: int = DEFAULT_SKIPPED_SAMPLE_LIMIT
     warnings: tuple[str, ...] = ()
 
 
@@ -67,9 +80,6 @@ class DatasetPreflightResult:
     lineage: DatasetLineage
     statistics: DatasetStatistics
     manifest: dict[str, Any]
-    selected_training_records: tuple[NormalizedRecord, ...] = ()
-    evaluation_records: tuple[NormalizedRecord, ...] = ()
-    skipped_records: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +89,15 @@ class NormalizedRecord:
     split: str
     metadata: dict[str, Any]
     line_number: int
+    source_uri: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SelectedTrainingExample:
+    record_id: str | None
+    line_number: int
+    input_ids: list[int]
+    labels: list[int]
     source_uri: str | None = None
 
 
@@ -147,7 +166,12 @@ def normalize_record(record: dict[str, Any], *, source_uri: str | None, line_num
     return NormalizedRecord(
         record_id=str(record_id) if record_id is not None else None,
         messages=_normalize_messages(record, source_uri=source_uri, line_number=line_number),
-        split=_normalize_split(record.get("split"), record_id=str(record_id) if record_id is not None else None, line_number=line_number, source_uri=source_uri),
+        split=_normalize_split(
+            record.get("split"),
+            record_id=str(record_id) if record_id is not None else None,
+            line_number=line_number,
+            source_uri=source_uri,
+        ),
         metadata=dict(record.get("metadata") or {}),
         line_number=line_number,
         source_uri=source_uri,
@@ -158,14 +182,18 @@ def messages_for_record(record: dict[str, Any]) -> list[dict[str, str]]:
     return list(_normalize_messages(record, source_uri=None, line_number=0))
 
 
+def iter_normalized_records(handle: Iterable[bytes | str], *, source_uri: str | None) -> Iterator[NormalizedRecord]:
+    for line_number, text in _iter_lines(handle):
+        yield normalize_record(
+            _json_object_at_line(text, source_uri=source_uri, line_number=line_number),
+            source_uri=source_uri,
+            line_number=line_number,
+        )
+
+
 def legacy_jsonl_records(path: Path) -> Iterator[NormalizedRecord]:
     with path.open(encoding="utf-8") as source:
         yield from iter_normalized_records(source, source_uri=str(path))
-
-
-def iter_normalized_records(handle: Iterable[bytes | str], *, source_uri: str | None) -> Iterator[NormalizedRecord]:
-    for line_number, text in _iter_lines(handle):
-        yield normalize_record(_json_object_at_line(text, source_uri=source_uri, line_number=line_number), source_uri=source_uri, line_number=line_number)
 
 
 def resolve_dataset_source(
@@ -189,7 +217,14 @@ def resolve_dataset_source(
     runtime = storage_runtime
     if runtime is None:
         from cognityx_storage import StorageConfig, StorageRuntime
-        runtime = StorageRuntime.load(config_file=storage_config) if storage_config else StorageRuntime.from_config(StorageConfig.built_in(root=storage_root or "/tmp/cognityx-training-storage"))
+
+        runtime = (
+            StorageRuntime.load(config_file=storage_config)
+            if storage_config
+            else StorageRuntime.from_config(
+                StorageConfig.built_in(root=storage_root or "/tmp/cognityx-training-storage")
+            )
+        )
     store = runtime.for_profile(parsed.netloc, role_name="dataset")
     return mode, store, {"runtime": runtime, "key": parsed.path.lstrip("/")}
 
@@ -236,6 +271,16 @@ def _records_key_from_uri(records_uri: str, runtime: Any) -> tuple[Any, str]:
     if namespace and key.startswith(namespace + "/"):
         key = key[len(namespace) + 1 :]
     return store, key
+
+
+def _stream_records(store: Any, key: str, *, source_uri: str | None) -> Iterator[NormalizedRecord]:
+    with store.open(key) as handle:
+        for line_number, text in _iter_lines(handle):
+            yield normalize_record(
+                _json_object_at_line(text, source_uri=source_uri, line_number=line_number),
+                source_uri=source_uri,
+                line_number=line_number,
+            )
 
 
 class DataForgeDatasetReader:
@@ -290,7 +335,7 @@ class DataForgeDatasetReader:
             )
         manifest = self.manifest()
         fields = _split_manifest_fields(manifest)
-        manifest_uri = self.dataset_uri if fields["dataset_manifest_uri"] is None else fields["dataset_manifest_uri"]
+        manifest_uri = fields["dataset_manifest_uri"] or self.dataset_uri
         return DatasetLineage(
             dataset_id=fields["dataset_id"],
             dataset_name=fields["dataset_name"],
@@ -318,33 +363,21 @@ class DataForgeDatasetReader:
         manifest = self.manifest()
         assert self._context is not None
         records_uri = manifest["records_uri"]
-        if normalize_checksum(manifest.get("records_checksum")) is None:
+        records_checksum = normalize_checksum(manifest.get("records_checksum"))
+        if records_checksum is None:
             raise ValueError(f"Malformed DataForge manifest at {self.dataset_uri}")
         runtime = self._context["runtime"]
         store, key = _records_key_from_uri(records_uri, runtime)
-        hasher = hashlib.sha256()
         with store.open(key) as handle:
-            for line_number, raw in enumerate(handle, start=1):
-                text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
-                hasher.update(text.encode("utf-8"))
-        if hasher.hexdigest() != normalize_checksum(manifest["records_checksum"]):
+            checksum = incremental_dataforge_checksum(handle)
+        if checksum != records_checksum:
             raise ValueError(f"Records checksum mismatch for {records_uri}")
-        with store.open(key) as handle:
-            for line_number, text in _iter_lines(handle):
-                yield normalize_record(
-                    _json_object_at_line(text, source_uri=records_uri, line_number=line_number),
-                    source_uri=records_uri,
-                    line_number=line_number,
-                )
+        yield from _stream_records(store, key, source_uri=records_uri)
 
-    def iter_training_records(self, *, max_examples: int | None = None) -> Iterator[NormalizedRecord]:
-        count = 0
+    def iter_training_records(self) -> Iterator[NormalizedRecord]:
         for record in self.iter_records():
             if record.split == "evaluation":
                 continue
-            if max_examples is not None and count >= max_examples:
-                break
-            count += 1
             yield record
 
     def iter_evaluation_records(self) -> Iterator[NormalizedRecord]:
@@ -352,7 +385,7 @@ class DataForgeDatasetReader:
             if record.split == "evaluation":
                 yield record
 
-    def statistics(self, *, max_examples: int | None = None) -> DatasetStatistics:
+    def statistics(self) -> DatasetStatistics:
         total = training = evaluation = 0
         split_summary: dict[str, int] = {}
         for record in self.iter_records():
@@ -362,14 +395,13 @@ class DataForgeDatasetReader:
                 evaluation += 1
             else:
                 training += 1
-        selected = min(training, max_examples) if max_examples is not None else training
         return DatasetStatistics(
             total_records=total,
             training_records=training,
             evaluation_records=evaluation,
-            selected_training_candidates=selected,
-            accepted_training_examples=selected,
-            skipped_overlength_examples=0,
+            selected_training_candidates=training,
+            accepted_training_examples=training,
+            skipped_overlength_count=0,
             maximum_observed_token_length=None,
             maximum_accepted_token_length=None,
             configured_max_sequence_length=None,
@@ -443,13 +475,42 @@ def encode_supervised_example(
         input_ids, labels = _assistant_mask_from_template(tokenizer, messages)
     except LookupError:
         input_ids, labels = _fallback_mask_from_prefixes(tokenizer, messages)
-    except Exception:
-        raise
     if max_sequence_length is not None and len(input_ids) > max_sequence_length:
         raise ValueError(
             f"Example exceeds maximum sequence length: {len(input_ids)} > {max_sequence_length}"
         )
     return {"input_ids": input_ids, "labels": labels}
+
+
+def iter_selected_training_examples(
+    reader: DataForgeDatasetReader,
+    tokenizer: Any,
+    *,
+    max_examples: int | None,
+    max_sequence_length: int,
+    overlength_policy: str,
+) -> Iterator[SelectedTrainingExample]:
+    accepted = 0
+    for record in reader.iter_records():
+        if record.split == "evaluation":
+            continue
+        encoded = encode_supervised_example(tokenizer, record.messages)
+        if len(encoded["input_ids"]) > max_sequence_length:
+            if overlength_policy == "skip":
+                continue
+            raise ValueError(
+                f"Record {record.record_id or record.line_number} at line {record.line_number} in {record.source_uri} exceeds maximum sequence length {max_sequence_length}."
+            )
+        yield SelectedTrainingExample(
+            record_id=record.record_id,
+            line_number=record.line_number,
+            input_ids=list(encoded["input_ids"]),
+            labels=list(encoded["labels"]),
+            source_uri=record.source_uri,
+        )
+        accepted += 1
+        if max_examples is not None and accepted >= max_examples:
+            break
 
 
 def collate_supervised_batch(batch: Sequence[dict[str, Any]], *, pad_token_id: int) -> dict[str, Any]:
@@ -474,6 +535,25 @@ def collate_supervised_batch(batch: Sequence[dict[str, Any]], *, pad_token_id: i
     }
 
 
+def _skip_sample(
+    record: NormalizedRecord,
+    *,
+    length: int,
+    max_sequence_length: int,
+    dataset_manifest_uri: str | None,
+    records_uri: str | None,
+) -> dict[str, Any]:
+    return {
+        "record_id": record.record_id,
+        "line_number": record.line_number,
+        "actual_token_count": length,
+        "maximum_sequence_length": max_sequence_length,
+        "dataset_manifest_uri": dataset_manifest_uri,
+        "records_uri": records_uri,
+        "reason": "overlength",
+    }
+
+
 def preflight_dataset(
     reader: DataForgeDatasetReader,
     tokenizer: Any,
@@ -481,61 +561,51 @@ def preflight_dataset(
     max_examples: int | None,
     max_sequence_length: int,
     overlength_policy: str,
+    skipped_sample_limit: int = DEFAULT_SKIPPED_SAMPLE_LIMIT,
 ) -> DatasetPreflightResult:
     manifest = reader.manifest() if reader.mode == "dataforge_manifest" else {}
     lineage = reader.lineage()
     manifest_train = manifest.get("train_count")
     manifest_eval = manifest.get("eval_count")
     manifest_accepted = manifest.get("accepted_count")
-    selected: list[NormalizedRecord] = []
-    evaluations: list[NormalizedRecord] = []
-    skipped: list[dict[str, Any]] = []
     total = training = evaluation = 0
+    selected_candidates = 0
+    accepted = 0
+    skipped_count = 0
     max_observed: int | None = None
     max_accepted: int | None = None
+    skipped_samples: list[dict[str, Any]] = []
     for record in reader.iter_records():
         total += 1
         if record.split == "evaluation":
             evaluation += 1
-            evaluations.append(record)
             continue
         training += 1
         tokenized = encode_supervised_example(tokenizer, record.messages)
         length = len(tokenized["input_ids"])
         max_observed = length if max_observed is None else max(max_observed, length)
+        selected_candidates += 1
         if length > max_sequence_length:
-            skipped_record = {
-                "record_id": record.record_id,
-                "line_number": record.line_number,
-                "actual_token_count": length,
-                "maximum_sequence_length": max_sequence_length,
-                "dataset_manifest_uri": lineage.dataset_manifest_uri,
-                "records_uri": lineage.records_uri,
-                "reason": "overlength",
-            }
+            skipped_count += 1
+            if len(skipped_samples) < skipped_sample_limit:
+                skipped_samples.append(
+                    _skip_sample(
+                        record,
+                        length=length,
+                        max_sequence_length=max_sequence_length,
+                        dataset_manifest_uri=lineage.dataset_manifest_uri,
+                        records_uri=lineage.records_uri,
+                    )
+                )
             if overlength_policy == "skip":
-                skipped.append(skipped_record)
                 continue
             raise ValueError(
                 f"Record {record.record_id or record.line_number} at line {record.line_number} in {lineage.records_uri} exceeds maximum sequence length {max_sequence_length}; "
                 f"manifest {lineage.dataset_manifest_uri}. Suggest increasing max_sequence_length or using overlength_policy=skip."
             )
-        if max_examples is None or len(selected) < max_examples:
-            selected.append(record)
+        if max_examples is None or accepted < max_examples:
+            accepted += 1
             max_accepted = length if max_accepted is None else max(max_accepted, length)
-        stats = DatasetStatistics(
-        total_records=total,
-        training_records=training,
-        evaluation_records=evaluation,
-        selected_training_candidates=min(training, max_examples) if max_examples is not None else training,
-        accepted_training_examples=len(selected),
-        skipped_overlength_examples=len(skipped),
-        maximum_observed_token_length=max_observed,
-        maximum_accepted_token_length=max_accepted,
-        configured_max_sequence_length=max_sequence_length,
-        split_summary={"train": training, "evaluation": evaluation},
-        warnings=(),
-    )
     if manifest_train is not None and int(manifest_train) != training:
         raise ValueError(
             f"Manifest train_count {manifest_train} disagrees with streamed training records {training}."
@@ -544,22 +614,33 @@ def preflight_dataset(
         raise ValueError(
             f"Manifest eval_count {manifest_eval} disagrees with streamed evaluation records {evaluation}."
         )
-    if manifest_accepted is not None and int(manifest_accepted) < len(selected):
+    if manifest_accepted is not None and int(manifest_accepted) < accepted:
         raise ValueError(
-            f"Manifest accepted_count {manifest_accepted} is smaller than accepted training examples {len(selected)}."
+            f"Manifest accepted_count {manifest_accepted} is smaller than accepted training examples {accepted}."
         )
-    if stats.accepted_training_examples == 0:
+    if accepted == 0:
         raise ValueError(
             f"No trainable examples remain after applying max_examples={max_examples} and overlength_policy={overlength_policy}."
         )
     lineage_payload = asdict(lineage)
     lineage_payload["overlength_policy"] = overlength_policy
-    lineage_payload["skipped_records"] = list(skipped)
+    lineage_payload["skipped_records"] = list(skipped_samples)
     return DatasetPreflightResult(
         lineage=DatasetLineage(**lineage_payload),
-        statistics=stats,
+        statistics=DatasetStatistics(
+            total_records=total,
+            training_records=training,
+            evaluation_records=evaluation,
+            selected_training_candidates=selected_candidates if max_examples is None else min(selected_candidates, max_examples),
+            accepted_training_examples=accepted,
+            skipped_overlength_count=skipped_count,
+            maximum_observed_token_length=max_observed,
+            maximum_accepted_token_length=max_accepted,
+            configured_max_sequence_length=max_sequence_length,
+            split_summary={"train": training, "evaluation": evaluation},
+            skipped_record_samples=tuple(skipped_samples),
+            skipped_record_sample_limit=skipped_sample_limit,
+            warnings=(),
+        ),
         manifest=manifest,
-        selected_training_records=tuple(selected),
-        evaluation_records=tuple(evaluations),
-        skipped_records=tuple(skipped),
     )
