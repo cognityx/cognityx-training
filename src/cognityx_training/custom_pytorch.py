@@ -19,6 +19,7 @@ from cognityx_training.dataset_pipeline import (
     DataForgeDatasetReader,
     collate_supervised_batch,
     encode_supervised_example,
+    preflight_dataset,
 )
 from cognityx_training.reporting import (
     ResourceMonitor,
@@ -34,6 +35,48 @@ from cognityx_training.telemetry import query_host, query_nvidia_gpus
 
 
 _PERSISTENT_MODEL_CACHE: dict[tuple[Any, ...], tuple[Any, Any]] = {}
+try:
+    import torch
+except ImportError:  # pragma: no cover - imported lazily in normal training paths
+    torch = None
+
+_IterableDatasetBase = torch.utils.data.IterableDataset if torch is not None else object
+
+
+class _StreamingTrainingDataset(_IterableDatasetBase):
+    def __init__(
+        self,
+        reader: DataForgeDatasetReader,
+        tokenizer: Any,
+        *,
+        max_examples: int | None,
+        max_sequence_length: int,
+        overlength_policy: str,
+    ) -> None:
+        super().__init__()
+        self.reader = reader
+        self.tokenizer = tokenizer
+        self.max_examples = max_examples
+        self.max_sequence_length = max_sequence_length
+        self.overlength_policy = overlength_policy
+
+    def __iter__(self):
+        emitted = 0
+        for record in self.reader.iter_training_records(max_examples=self.max_examples):
+            try:
+                encoded = encode_supervised_example(
+                    self.tokenizer,
+                    record.messages,
+                    max_sequence_length=self.max_sequence_length,
+                )
+            except ValueError:
+                if self.overlength_policy == "skip":
+                    continue
+                raise
+            emitted += 1
+            yield encoded
+        if emitted == 0:
+            raise ValueError("No trainable examples remain after filtering.")
 
 
 def _evaluate_model(
@@ -142,40 +185,12 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
         )
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
-        evaluation_records = list(reader.iter_evaluation_records())
-        training_examples: list[dict[str, list[int]]] = []
-        skipped_records: list[dict[str, Any]] = []
-        for record in reader.iter_training_records(max_examples=self.config.max_examples):
-            encoded = encode_supervised_example(tokenizer, record.messages)
-            if len(encoded["input_ids"]) > self.config.max_sequence_length:
-                if self.config.overlength_policy == "skip":
-                    skipped_records.append(
-                        {
-                            "record_id": record.record_id,
-                            "line_number": record.line_number,
-                            "actual_token_count": len(encoded["input_ids"]),
-                            "maximum_sequence_length": self.config.max_sequence_length,
-                            "reason": "overlength",
-                        }
-                    )
-                    continue
-                raise ValueError(
-                    f"Record {record.record_id or record.line_number} exceeds maximum sequence length "
-                    f"({len(encoded['input_ids'])} > {self.config.max_sequence_length}) for {reader.dataset_uri}"
-                )
-            training_examples.append(encoded)
-        preflight = reader.statistics(max_examples=self.config.max_examples)
-        preflight = preflight.__class__(
-            training_records=preflight.training_records,
-            evaluation_records=preflight.evaluation_records,
-            selected_training_records=len(training_examples),
-            skipped_records=len(skipped_records),
-            maximum_observed_token_length=max(
-                (len(item["input_ids"]) for item in training_examples), default=None
-            ),
-            configured_max_sequence_length=self.config.max_sequence_length,
-            split_summary=preflight.split_summary,
-            validation_warnings=preflight.validation_warnings,
+        preflight = preflight_dataset(
+            reader,
+            tokenizer,
+            max_examples=self.config.max_examples,
+            max_sequence_length=self.config.max_sequence_length,
+            overlength_policy=self.config.overlength_policy,
         )
         model_kwargs: dict[str, Any] = {
             "device_map": "auto",
@@ -217,7 +232,7 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
         baseline_evaluation = _evaluate_model(
             model,
             tokenizer,
-            evaluation_records,
+            reader.iter_evaluation_records(),
             input_device,
             self.config.evaluation_max_new_tokens,
             torch,
@@ -234,14 +249,19 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
         )
         final_parameters = parameter_counts(model)
 
+        dataset = _StreamingTrainingDataset(
+            reader,
+            tokenizer,
+            max_examples=self.config.max_examples,
+            max_sequence_length=self.config.max_sequence_length,
+            overlength_policy=self.config.overlength_policy,
+        )
         loader = torch.utils.data.DataLoader(
-            training_examples,
+            dataset,
             batch_size=self.config.per_device_train_batch_size,
-            shuffle=True,
             collate_fn=lambda batch: collate_supervised_batch(
                 batch,
                 pad_token_id=tokenizer.pad_token_id,
-                max_sequence_length=self.config.max_sequence_length,
             ),
         )
         run_id = self.config.run_id or datetime.now(timezone.utc).strftime(
@@ -336,7 +356,14 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
         )
         model.save_pretrained(str(output_dir))
         tokenizer.save_pretrained(str(output_dir))
-        trained_evaluation = _evaluate_model(model, tokenizer, evaluation_records, input_device, self.config.evaluation_max_new_tokens, torch)
+        trained_evaluation = _evaluate_model(
+            model,
+            tokenizer,
+            reader.iter_evaluation_records(),
+            input_device,
+            self.config.evaluation_max_new_tokens,
+            torch,
+        )
         runtime_seconds = time.perf_counter() - started
         resources = monitor.stop()
         finished_at = utc_now()
@@ -344,10 +371,10 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
             "train_loss": sum(losses) / len(losses),
             "train_steps": completed_steps,
             "train_runtime_seconds": runtime_seconds,
-            "training_examples": len(training_examples),
-            "dataset_examples_available": preflight.training_records + preflight.evaluation_records,
-            "dataset_examples_selected": preflight.selected_training_records,
-            "evaluation_examples": preflight.evaluation_records,
+            "training_examples": preflight.statistics.accepted_training_examples,
+            "dataset_examples_available": preflight.statistics.total_records,
+            "dataset_examples_selected": preflight.statistics.selected_training_candidates,
+            "evaluation_examples": preflight.statistics.evaluation_records,
             "micro_batch_size": self.config.per_device_train_batch_size,
             "gradient_accumulation_steps": self.config.gradient_accumulation_steps,
             "effective_batch_size": (
@@ -390,20 +417,22 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
                 "version": request.dataset.version,
                 "uri": request.dataset.uri,
                 "lineage": {
-                    "dataset_id": reader.lineage().dataset_id,
-                    "dataset_version": reader.lineage().dataset_version,
-                    "dataset_variant_id": reader.lineage().dataset_variant_id,
-                    "dataset_manifest_uri": reader.lineage().dataset_manifest_uri,
-                    "dataset_manifest_checksum": reader.lineage().dataset_manifest_checksum,
-                    "records_uri": reader.lineage().records_uri,
-                    "records_checksum": reader.lineage().records_checksum,
-                    "recipe": reader.lineage().recipe,
-                    "source_manifest_uri": reader.lineage().source_manifest_uri,
-                    "source_manifest_checksum": reader.lineage().source_manifest_checksum,
-                    "split_summary": reader.lineage().split_summary,
-                    "record_counts": reader.lineage().record_counts,
-                    "overlength_policy": reader.lineage().overlength_policy,
-                    "skipped_records": skipped_records,
+                    "dataset_id": preflight.lineage.dataset_id,
+                    "dataset_name": preflight.lineage.dataset_name,
+                    "dataset_version": preflight.lineage.dataset_version,
+                    "dataset_variant_id": preflight.lineage.dataset_variant_id,
+                    "dataset_manifest_uri": preflight.lineage.dataset_manifest_uri,
+                    "dataset_manifest_checksum": preflight.lineage.dataset_manifest_checksum,
+                    "records_uri": preflight.lineage.records_uri,
+                    "records_checksum": preflight.lineage.records_checksum,
+                    "recipe": preflight.lineage.recipe,
+                    "source_manifest_uri": preflight.lineage.source_manifest_uri,
+                    "source_manifest_checksum": preflight.lineage.source_manifest_checksum,
+                    "configuration_checksum": preflight.lineage.configuration_checksum,
+                    "split_summary": preflight.statistics.split_summary,
+                    "record_counts": preflight.lineage.record_counts,
+                    "overlength_policy": preflight.lineage.overlength_policy,
+                    "skipped_records": list(preflight.skipped_records),
                 },
             },
             "configuration": jsonable_configuration(self.config),
