@@ -17,6 +17,7 @@ from cognityx_training.evaluation import (
     pair_predictions,
     recommendation_for,
     validate_judge_response,
+    request_id,
 )
 from cognityx_training.evaluation_configuration import (
     EvidenceConfig,
@@ -28,11 +29,16 @@ from cognityx_training.evaluation_pipeline import (
     EvaluationPipeline,
     show_evaluation,
 )
+from cognityx_training.evaluation_pairing import PredictionPairingStore
 from cognityx_training.lineage import (
     TrainingLineageIds,
     adapter_id,
 )
 from cognityx_training.publication import TrainingPublisher
+from cognityx_training.storage_uri import (
+    StorageUriResolutionError,
+    resolve_storage_uri,
+)
 
 
 def _runtime(root: Path) -> StorageRuntime:
@@ -188,10 +194,17 @@ def _publication(
     run: str = "trun-candidate-one",
     record_ids: tuple[str, ...] = ("one",),
     publish_evidence: bool = True,
+    shared_evidence: bool = False,
 ) -> str:
     artifact_store = runtime.for_role("artifact")
-    evidence_ref = artifact_store.put_bytes(
-        f"ingest/documents/{run}/evidence.jsonl",
+    evidence_store = (
+        artifact_store._client.for_shared_data()
+        if shared_evidence
+        else artifact_store
+    )
+    evidence_key = f"ingest/documents/{run}/evidence.jsonl"
+    stored_evidence = evidence_store.put_bytes(
+        evidence_key,
         b"".join(
             (
                 json.dumps(
@@ -207,16 +220,27 @@ def _publication(
             if publish_evidence
         ),
         media_type="application/x-ndjson",
-    ).uri
-    source_manifest_uri = artifact_store.put_json_idempotent(
-        f"ingest/runs/{run}/manifest.json",
+    )
+    evidence_ref = (
+        evidence_store.uri(evidence_key)
+        if shared_evidence
+        else stored_evidence.uri
+    )
+    source_key = f"ingest/runs/{run}/manifest.json"
+    stored_source = evidence_store.put_json_idempotent(
+        source_key,
         {
             "schema_version": "cognityx.ingest.run/v1",
             "evidence_refs": [evidence_ref],
         },
-    ).uri
-    dataset_manifest_uri = artifact_store.put_json_idempotent(
-        f"datasets/eval/{run}/manifest.json",
+    )
+    source_manifest_uri = (
+        evidence_store.uri(source_key)
+        if shared_evidence
+        else stored_source.uri
+    )
+    dataset_manifest_uri = runtime.for_role("dataset").put_json_idempotent(
+        f"eval/{run}/manifest.json",
         {
             "schema_version": "cognityx.dataforge.dataset/v1",
             "dataset_id": "dataset-eval",
@@ -278,6 +302,41 @@ def _config(
         checkpoint_interval=1,
     )
     return replace(config, **changes)
+
+
+def _deterministic_row(
+    record_id: str,
+    *,
+    baseline: bool | None,
+    candidate: bool | None,
+    duplicate_baseline: bool = False,
+    duplicate_candidate: bool = False,
+) -> dict[str, Any]:
+    return {
+        "candidate_id": "adp-one",
+        "dataset_record_id": record_id,
+        "baseline": (
+            {"normalized_exact_match": baseline}
+            if baseline is not None
+            else None
+        ),
+        "candidate": (
+            {"normalized_exact_match": candidate}
+            if candidate is not None
+            else None
+        ),
+        "missing_prediction": (
+            "baseline"
+            if baseline is None
+            else "candidate"
+            if candidate is None
+            else None
+        ),
+        "duplicate_prediction": {
+            "baseline": duplicate_baseline,
+            "candidate": duplicate_candidate,
+        },
+    }
 
 
 def test_evaluation_config_requires_storage_candidate_identity(tmp_path: Path) -> None:
@@ -386,6 +445,63 @@ def test_aggregate_and_gates() -> None:
     assert recommendation["recommendation"] == "manual_review_required"
 
 
+def test_aggregate_uses_only_paired_deterministic_denominator() -> None:
+    rows = [
+        _deterministic_row("paired", baseline=True, candidate=False),
+        _deterministic_row("candidate-only", baseline=None, candidate=True),
+        _deterministic_row("baseline-only", baseline=True, candidate=None),
+    ]
+    aggregate = aggregate_candidate("adp-one", rows, [])
+    assert aggregate["record_count"] == 3
+    assert aggregate["paired_record_count"] == 1
+    assert aggregate["deterministic_accuracy"] == 0.0
+    assert aggregate["baseline_deterministic_accuracy"] == 1.0
+    assert aggregate["paired_exact_match_delta"] == -1.0
+    assert aggregate["missing_baseline_count"] == 1
+    assert aggregate["missing_candidate_count"] == 1
+    assert aggregate["candidate_exact_match_count"] == 0
+    assert aggregate["baseline_exact_match_count"] == 1
+    assert aggregate["deterministic_regression"] is True
+    assert all(
+        0.0 <= aggregate[field] <= 1.0
+        for field in (
+            "record_coverage",
+            "deterministic_accuracy",
+            "baseline_deterministic_accuracy",
+            "candidate_win_rate",
+            "baseline_win_rate",
+            "tie_rate",
+            "regression_rate",
+            "unjudgeable_rate",
+        )
+    )
+
+
+def test_aggregate_handles_no_paired_rows_and_duplicate_counts() -> None:
+    rows = [
+        _deterministic_row(
+            "candidate-only",
+            baseline=None,
+            candidate=True,
+            duplicate_candidate=True,
+        ),
+        _deterministic_row(
+            "baseline-only",
+            baseline=True,
+            candidate=None,
+            duplicate_baseline=True,
+        ),
+    ]
+    aggregate = aggregate_candidate("adp-one", rows, [])
+    assert aggregate["paired_record_count"] == 0
+    assert aggregate["deterministic_accuracy"] == 0.0
+    assert aggregate["baseline_deterministic_accuracy"] == 0.0
+    assert aggregate["paired_exact_match_delta"] == 0.0
+    assert aggregate["deterministic_regression"] is False
+    assert aggregate["duplicate_baseline_count"] == 1
+    assert aggregate["duplicate_candidate_count"] == 1
+
+
 def test_plan_validates_artifacts_without_acquiring_or_calling_judge(
     tmp_path: Path,
 ) -> None:
@@ -399,6 +515,15 @@ def test_plan_validates_artifacts_without_acquiring_or_calling_judge(
     ).plan()
     assert result["status"] == "planned"
     assert result["candidate_model_loaded"] is False
+    assert result["token_budget_check_mode"] == "estimated"
+    assert result["exact_token_count_available"] is False
+    assert result["evidence_resolution_summary"]["resolvable"] is True
+    resolved_roles = {
+        item["selected_role"]
+        for candidate in result["evidence_resolution_summary"]["candidates"]
+        for item in candidate["resolved_uris"]
+    }
+    assert {"dataset", "artifact"} <= resolved_roles
     assert judge.diagnose_calls == judge.capability_calls == 1
     assert judge.acquire_calls == judge.count_calls == judge.judge_calls == 0
 
@@ -474,6 +599,85 @@ def test_run_resolves_evidence_and_writes_terminal_last(tmp_path: Path) -> None:
         storage_runtime=runtime,
     )
     assert shown["status"] == "completed"
+
+
+def test_shared_legacy_evidence_uri_resolves_through_default_profile(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path / "storage")
+    publication = _publication(
+        runtime,
+        tmp_path,
+        shared_evidence=True,
+    )
+    plan = EvaluationPipeline(
+        _config((publication,), tmp_path),
+        storage_runtime=runtime,
+        judge_client=FakeJudge(),
+    ).plan()
+    resolutions = [
+        item
+        for candidate in plan["evidence_resolution_summary"]["candidates"]
+        for item in candidate["resolved_uris"]
+    ]
+    assert any(
+        item["selected_role"] == "shared"
+        and item["selected_profile"] == "local-main"
+        for item in resolutions
+    )
+
+
+def test_storage_uri_resolution_is_namespace_authoritative(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path / "storage")
+    publication = _publication(runtime, tmp_path)
+    manifest = _read_uri(runtime, publication)
+    dataset_uri = _read_uri(runtime, publication.replace(
+        "publication-manifest.json", "dataset-lineage.json"
+    ))["dataset_manifest_uri"]
+    assert resolve_storage_uri(runtime, publication).selected_role == "artifact"
+    assert resolve_storage_uri(runtime, dataset_uri).selected_role == "dataset"
+    assert (
+        resolve_storage_uri(runtime, manifest["adapter_manifest_uri"]).selected_role
+        == "model"
+    )
+    with pytest.raises(StorageUriResolutionError, match="not configured"):
+        resolve_storage_uri(runtime, "storage://local-main/unknown/value.json")
+    with pytest.raises(StorageUriResolutionError, match="not override"):
+        resolve_storage_uri(runtime, dataset_uri, role_override="artifact")
+
+
+def test_large_pairing_store_is_disk_backed_ordered_and_incremental(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "pairs.sqlite3"
+    store = PredictionPairingStore(path)
+    observed = 0
+
+    def rows(prediction_type: str):
+        nonlocal observed
+        for index in range(2000, 0, -1):
+            observed += 1
+            yield {
+                "dataset_record_id": f"record-{index:05d}",
+                "prediction_type": prediction_type,
+            }
+
+    store.ingest("adp-large", "baseline", rows("baseline"))
+    assert observed == 2000
+    store.ingest("adp-large", "candidate", rows("trained"))
+    assert observed == 4000
+    pairs = store.iter_pairs("adp-large")
+    first = next(pairs)
+    assert first.record_id == "record-00001"
+    assert store.summary("adp-large")["paired_count"] == 2000
+    assert path.stat().st_size > 0
+    with pytest.raises(ValueError, match="Conflicting baseline"):
+        store.ingest(
+            "adp-large",
+            "baseline",
+            [{"dataset_record_id": "record-00001", "changed": True}],
+        )
+    store.close(remove=False)
 
 
 def test_malformed_judge_response_is_retried(tmp_path: Path) -> None:
@@ -631,6 +835,125 @@ def test_resume_skips_committed_judge_results(tmp_path: Path) -> None:
     assert resumed["resumed"] is True
 
 
+@pytest.mark.parametrize(
+    ("failed_attempts", "expected_attempt"),
+    [((0,), 1), ((0, 1), 2)],
+)
+def test_resume_starts_at_next_unused_attempt(
+    tmp_path: Path,
+    failed_attempts: tuple[int, ...],
+    expected_attempt: int,
+) -> None:
+    pipeline, candidates, judge = _prepared_attempt_pipeline(tmp_path)
+    candidate_id = candidates[0]["adapter_id"]
+    for attempt in failed_attempts:
+        identity = request_id(
+            str(pipeline.run_id), candidate_id, "one", attempt
+        )
+        pipeline._put_attempt(
+            "judge-requests",
+            identity,
+            {"request_id": identity, "attempt": attempt},
+        )
+        pipeline._put_attempt(
+            "rejections",
+            identity,
+            pipeline._rejection(
+                candidate_id,
+                "one",
+                attempt=attempt,
+                reason="judge_request_failed",
+                detail="fixture failure",
+                request_identity=identity,
+            ),
+        )
+    pipeline._judge_stage(candidates, judge)
+    assert judge.judge_calls == 1
+    assert judge.request_ids == [
+        request_id(
+            str(pipeline.run_id),
+            candidate_id,
+            "one",
+            expected_attempt,
+        )
+    ]
+    assert len(set(judge.request_ids)) == len(judge.request_ids)
+    pipeline._close_pairing()
+
+
+def test_orphan_request_is_rejected_and_not_reused(tmp_path: Path) -> None:
+    pipeline, candidates, judge = _prepared_attempt_pipeline(tmp_path)
+    candidate_id = candidates[0]["adapter_id"]
+    orphan = request_id(str(pipeline.run_id), candidate_id, "one", 0)
+    pipeline._put_attempt(
+        "judge-requests",
+        orphan,
+        {"request_id": orphan, "attempt": 0},
+    )
+    _, rejections = pipeline._judge_stage(candidates, judge)
+    assert judge.request_ids == [
+        request_id(str(pipeline.run_id), candidate_id, "one", 1)
+    ]
+    assert any(
+        item["request_id"] == orphan
+        and item["reason"] == "interrupted_judge_attempt"
+        for item in rejections
+    )
+    pipeline._close_pairing()
+
+
+@pytest.mark.parametrize("terminal_reason", ["token_budget_exceeded", "exhausted"])
+def test_terminal_attempt_state_causes_zero_new_calls(
+    tmp_path: Path,
+    terminal_reason: str,
+) -> None:
+    pipeline, candidates, judge = _prepared_attempt_pipeline(tmp_path)
+    candidate_id = candidates[0]["adapter_id"]
+    attempts = (0,) if terminal_reason == "token_budget_exceeded" else (0, 1, 2)
+    for attempt in attempts:
+        identity = request_id(
+            str(pipeline.run_id), candidate_id, "one", attempt
+        )
+        reason = (
+            "token_budget_exceeded"
+            if terminal_reason == "token_budget_exceeded"
+            else "judge_request_failed"
+        )
+        pipeline._put_attempt(
+            "rejections",
+            identity,
+            pipeline._rejection(
+                candidate_id,
+                "one",
+                attempt=attempt,
+                reason=reason,
+                detail="terminal fixture",
+                request_identity=identity,
+            ),
+        )
+    pipeline._judge_stage(candidates, judge)
+    assert judge.judge_calls == 0
+    pipeline._close_pairing()
+
+
+def test_existing_success_causes_zero_new_judge_calls(tmp_path: Path) -> None:
+    pipeline, candidates, judge = _prepared_attempt_pipeline(tmp_path)
+    candidate_id = candidates[0]["adapter_id"]
+    identity = request_id(str(pipeline.run_id), candidate_id, "one", 0)
+    pipeline.artifact_store.put_json_idempotent(
+        pipeline._row_key("judge-results", candidate_id, "one"),
+        {
+            "request_id": identity,
+            "candidate_id": candidate_id,
+            "dataset_record_id": "one",
+            "result": _valid_judgment(),
+        },
+    )
+    pipeline._judge_stage(candidates, judge)
+    assert judge.judge_calls == 0
+    pipeline._close_pairing()
+
+
 def test_resident_judge_is_not_released(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path / "storage")
     publication = _publication(runtime, tmp_path)
@@ -680,3 +1003,22 @@ def _read_store(store: Any, key: str) -> dict[str, Any]:
 def _read_jsonl(store: Any, key: str) -> list[dict[str, Any]]:
     with store.open(key) as source:
         return [json.loads(line) for line in source if line.strip()]
+
+
+def _prepared_attempt_pipeline(
+    tmp_path: Path,
+) -> tuple[EvaluationPipeline, list[dict[str, Any]], FakeJudge]:
+    runtime = _runtime(tmp_path / "storage")
+    publication = _publication(runtime, tmp_path)
+    judge = FakeJudge()
+    pipeline = EvaluationPipeline(
+        _config((publication,), tmp_path, maximum_judge_retries=2),
+        storage_runtime=runtime,
+        judge_client=judge,
+        run_id="eval-resume-fixture",
+        variant_id="evar-resume-fixture",
+        root="experiments/exp-evaluation/evaluations/eval-resume-fixture",
+    )
+    candidates = pipeline._preflight_candidates()
+    pipeline._evidence_stage(candidates)
+    return pipeline, candidates, judge
