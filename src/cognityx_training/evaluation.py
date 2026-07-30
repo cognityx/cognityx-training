@@ -255,10 +255,31 @@ def aggregate_candidate(
     *,
     rejection_count: int = 0,
 ) -> dict[str, Any]:
-    deterministic_rows = list(deterministic)
     judge_rows = list(judgments)
-    total = len(deterministic_rows)
-    paired = sum(row.get("missing_prediction") is None for row in deterministic_rows)
+    total = 0
+    paired = 0
+    missing_baseline = 0
+    missing_candidate = 0
+    duplicate_baseline = 0
+    duplicate_candidate = 0
+    candidate_exact = 0
+    baseline_exact = 0
+    for row in deterministic:
+        total += 1
+        missing = row.get("missing_prediction")
+        missing_baseline += int(missing == "baseline")
+        missing_candidate += int(missing == "candidate")
+        duplicates = row.get("duplicate_prediction") or {}
+        duplicate_baseline += int(bool(duplicates.get("baseline")))
+        duplicate_candidate += int(bool(duplicates.get("candidate")))
+        if missing is None:
+            paired += 1
+            candidate_exact += int(
+                bool(row["candidate"]["normalized_exact_match"])
+            )
+            baseline_exact += int(
+                bool(row["baseline"]["normalized_exact_match"])
+            )
     valid_judgments = [row for row in judge_rows if row.get("result")]
     decisions = [row["result"]["decision"] for row in valid_judgments]
 
@@ -271,16 +292,8 @@ def aggregate_candidate(
         return sum(values) / len(values) if values else None
 
     denominator = len(valid_judgments)
-    candidate_exact = sum(
-        bool(row["candidate"]["normalized_exact_match"])
-        for row in deterministic_rows
-        if row.get("candidate")
-    )
-    baseline_exact = sum(
-        bool(row["baseline"]["normalized_exact_match"])
-        for row in deterministic_rows
-        if row.get("baseline")
-    )
+    candidate_accuracy = candidate_exact / paired if paired else 0.0
+    baseline_accuracy = baseline_exact / paired if paired else 0.0
     latency = [
         float(row.get("latency_seconds", 0))
         for row in valid_judgments
@@ -292,8 +305,15 @@ def aggregate_candidate(
         "record_count": total,
         "paired_record_count": paired,
         "record_coverage": paired / total if total else 0.0,
-        "deterministic_accuracy": candidate_exact / paired if paired else 0.0,
-        "baseline_deterministic_accuracy": baseline_exact / paired if paired else 0.0,
+        "missing_baseline_count": missing_baseline,
+        "missing_candidate_count": missing_candidate,
+        "duplicate_baseline_count": duplicate_baseline,
+        "duplicate_candidate_count": duplicate_candidate,
+        "candidate_exact_match_count": candidate_exact,
+        "baseline_exact_match_count": baseline_exact,
+        "paired_exact_match_delta": candidate_accuracy - baseline_accuracy,
+        "deterministic_accuracy": candidate_accuracy,
+        "baseline_deterministic_accuracy": baseline_accuracy,
         "deterministic_regression": candidate_exact < baseline_exact,
         "judge_reference_correctness_mean": mean_score(
             "candidate", "reference_correctness"

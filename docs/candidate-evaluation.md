@@ -46,6 +46,21 @@ publication manifest
 -> evidence JSONL
 ```
 
+Storage URIs are authoritative. The evaluator maps the URI namespace to the
+configured role:
+
+| URI namespace | Storage role |
+| --- | --- |
+| `datasets` | `dataset` |
+| `artifacts` | `artifact` |
+| `models` | `model` |
+| `temporary` | `temporary` |
+
+Older `storage://shared/...` references use the configured default profile and
+the Storage client's shared scope. Unknown namespaces fail unless a caller
+supplies an explicit authoritative role override; known namespaces cannot be
+reinterpreted through a conflicting role.
+
 By default, artifacts retain evidence IDs and SHA-256 hashes but not evidence
 text. `missing_policy = "reference-only"` explicitly labels judgments made
 without complete evidence. Use `unjudgeable` or `error` for stricter workflows.
@@ -103,9 +118,20 @@ artifacts are streamed through bounded temporary files. The terminal
 `evaluation-manifest.json` is written last and is the sole completed-evaluation
 signal.
 
+A temporary SQLite index streams baseline and candidate prediction JSONL,
+detects duplicate conflicts during insertion, and yields pairs in deterministic
+record-ID order. Prediction files are never converted wholesale into Python
+lists. Deterministic paired accuracy uses only records with both outputs;
+unpaired records affect coverage and missing counts but never paired accuracy.
+
 A failure preserves checkpoints, valid judge results, and `failure.json`; it
 does not create a terminal manifest or alter source Training artifacts. Resume
 retains the original `evaluation_run_id`.
+
+Resume scans durable request, rejection, and result rows before every judgment.
+Successful and token-budget-terminal requests are never repeated. Exhausted
+requests remain terminal. A request with no result or rejection is recorded as
+`interrupted_judge_attempt`, and resume advances to the next unused attempt ID.
 
 ## Recommendations
 

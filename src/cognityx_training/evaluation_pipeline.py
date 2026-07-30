@@ -19,11 +19,11 @@ from cognityx_training.evaluation import (
     deterministic_result,
     evaluation_run_id,
     evaluation_variant_id,
-    pair_predictions,
     recommendation_for,
     request_id,
     validate_judge_response,
 )
+from cognityx_training.evaluation_pairing import PredictionPairingStore
 from cognityx_training.evaluation_configuration import EvaluationConfig
 from cognityx_training.evaluation_judge import (
     CognityxJudgeClient,
@@ -38,6 +38,10 @@ from cognityx_training.publication import (
 )
 from cognityx_training.reporting import utc_now
 from cognityx_training.storage_runtime import resolve_storage_runtime
+from cognityx_training.storage_uri import (
+    StorageUriResolutionError,
+    resolve_storage_uri,
+)
 
 
 class EvaluationPipeline:
@@ -64,77 +68,92 @@ class EvaluationPipeline:
         self.run_id = run_id
         self.variant_id = variant_id
         self.root = root
+        self.pairing_store: PredictionPairingStore | None = None
 
     def plan(self) -> dict[str, Any]:
         """Perform complete artifact preflight without loading or calling a judge."""
-        candidates = self._preflight_candidates()
-        identity = self._variant_identity(candidates)
-        diagnostic: Mapping[str, Any]
-        capabilities: Mapping[str, Any]
-        judge = self._judge_client()
         try:
-            diagnostic = judge.diagnose()
-        except Exception as exc:
-            diagnostic = {"reachable": False, "error": type(exc).__name__, "detail": str(exc)}
-        try:
-            capabilities = judge.capabilities()
-        except Exception as exc:
-            capabilities = {"available": False, "error": type(exc).__name__, "detail": str(exc)}
-        advertised = capabilities.get("capabilities", capabilities)
-        if (
-            isinstance(advertised, Mapping)
-            and "structured_output" in advertised
-            and advertised["structured_output"] is False
-        ):
-            raise ValueError("Configured judge does not support structured output")
-        context = capabilities.get("context")
-        if isinstance(context, Mapping):
-            advertised_context = context.get("max_context_tokens")
-            advertised_output = context.get("max_output_tokens_limit")
+            candidates = self._preflight_candidates()
+            identity = self._variant_identity(candidates)
+            evidence_summary = self._evidence_resolution_summary(candidates)
+            pairing_summary = {
+                item["adapter_id"]: dict(item["pairing_summary"])
+                for item in candidates
+            }
+            diagnostic: Mapping[str, Any]
+            capabilities: Mapping[str, Any]
+            judge = self._judge_client()
+            try:
+                diagnostic = judge.diagnose()
+            except Exception as exc:
+                diagnostic = {"reachable": False, "error": type(exc).__name__, "detail": str(exc)}
+            try:
+                capabilities = judge.capabilities()
+            except Exception as exc:
+                capabilities = {"available": False, "error": type(exc).__name__, "detail": str(exc)}
+            advertised = capabilities.get("capabilities", capabilities)
             if (
-                isinstance(advertised_context, int)
-                and self.config.judge.context_limit_tokens > advertised_context
+                isinstance(advertised, Mapping)
+                and "structured_output" in advertised
+                and advertised["structured_output"] is False
             ):
-                raise ValueError(
-                    "Configured context_limit_tokens exceeds judge capability"
-                )
-            if (
-                isinstance(advertised_output, int)
-                and self.config.judge.max_output_tokens > advertised_output
-            ):
-                raise ValueError(
-                    "Configured max_output_tokens exceeds judge capability"
-                )
-        estimated_max_input = max(
-            (
-                _estimate_pair_tokens(pair)
-                for candidate in candidates
-                for pair in candidate["pairs"]
-            ),
-            default=0,
-        )
-        if estimated_max_input + self.config.judge.max_output_tokens > self.config.judge.context_limit_tokens:
-            raise ValueError(
-                "Estimated judge input plus output budget exceeds context_limit_tokens"
+                raise ValueError("Configured judge does not support structured output")
+            context = capabilities.get("context")
+            if isinstance(context, Mapping):
+                advertised_context = context.get("max_context_tokens")
+                advertised_output = context.get("max_output_tokens_limit")
+                if (
+                    isinstance(advertised_context, int)
+                    and self.config.judge.context_limit_tokens > advertised_context
+                ):
+                    raise ValueError(
+                        "Configured context_limit_tokens exceeds judge capability"
+                    )
+                if (
+                    isinstance(advertised_output, int)
+                    and self.config.judge.max_output_tokens > advertised_output
+                ):
+                    raise ValueError(
+                        "Configured max_output_tokens exceeds judge capability"
+                    )
+            estimated_max_input = max(
+                (
+                    _estimate_pair_tokens(pair)
+                    for candidate in candidates
+                    for pair in self._pairs(candidate)
+                ),
+                default=0,
             )
-        return {
-            "status": "planned",
-            "name": self.config.name,
-            "evaluation_variant_id": evaluation_variant_id(identity),
-            "candidate_count": len(candidates),
-            "record_count": sum(len(item["pairs"]) for item in candidates),
-            "estimated_max_input_tokens": estimated_max_input,
-            "judge_diagnostic": dict(diagnostic),
-            "judge_capabilities": dict(capabilities),
-            "execution_mode": "saved-output-sequential-judge",
-            "candidate_model_loaded": False,
-            "base_student_model_loaded": False,
-            "warnings": [
-                issue
-                for candidate in candidates
-                for issue in candidate["pairing_issues"]
-            ],
-        }
+            if estimated_max_input + self.config.judge.max_output_tokens > self.config.judge.context_limit_tokens:
+                raise ValueError(
+                    "Estimated judge input plus output budget exceeds context_limit_tokens"
+                )
+            return {
+                "status": "planned",
+                "name": self.config.name,
+                "evaluation_variant_id": evaluation_variant_id(identity),
+                "candidate_count": len(candidates),
+                "record_count": sum(
+                    item["pairing_summary"]["record_count"] for item in candidates
+                ),
+                "estimated_max_input_tokens": estimated_max_input,
+                "exact_token_count_available": False,
+                "token_budget_check_mode": "estimated",
+                "evidence_resolution_summary": evidence_summary,
+                "candidate_pairing_summary": pairing_summary,
+                "judge_diagnostic": dict(diagnostic),
+                "judge_capabilities": dict(capabilities),
+                "execution_mode": "saved-output-sequential-judge",
+                "candidate_model_loaded": False,
+                "base_student_model_loaded": False,
+                "warnings": [
+                    issue
+                    for candidate in candidates
+                    for issue in candidate["pairing_issues"]
+                ],
+            }
+        finally:
+            self._close_pairing()
 
     def run(self, *, resume: bool = False) -> dict[str, Any]:
         """Execute or resume one sequential evaluation."""
@@ -157,20 +176,18 @@ class EvaluationPipeline:
                 artifact_checksums={},
             )
 
-            deterministic_rows = self._deterministic_stage(candidates)
-            evidence_rows, evidence_by_candidate = self._evidence_stage(candidates)
+            deterministic_count = self._deterministic_stage(candidates)
+            evidence_count = self._evidence_stage(candidates)
 
             judge = self._judge_client()
             lifecycle = dict(judge.acquire())
             acquired = bool(lifecycle.get("loaded_by_evaluation"))
             judgment_rows, rejection_rows = self._judge_stage(
                 candidates,
-                evidence_by_candidate,
                 judge,
             )
             aggregate = self._aggregation_stage(
                 candidates,
-                deterministic_rows,
                 judgment_rows,
                 rejection_rows,
             )
@@ -192,8 +209,8 @@ class EvaluationPipeline:
                 acquired = False
             manifest = self._finalize(
                 candidates=candidates,
-                deterministic_rows=deterministic_rows,
-                evidence_rows=evidence_rows,
+                deterministic_count=deterministic_count,
+                evidence_count=evidence_count,
                 judgment_rows=judgment_rows,
                 rejection_rows=rejection_rows,
                 aggregate=aggregate,
@@ -211,6 +228,7 @@ class EvaluationPipeline:
                     self.judge.release()
                 except Exception:
                     pass
+            self._close_pairing()
 
     @classmethod
     def from_request(
@@ -221,7 +239,7 @@ class EvaluationPipeline:
         judge_client: JudgeClient | None = None,
     ) -> "EvaluationPipeline":
         runtime = resolve_storage_runtime(storage_runtime=storage_runtime)
-        request = _read_uri_json(runtime, evaluation_request_uri, role_name="artifact")
+        request = _read_uri_json(runtime, evaluation_request_uri)
         if request.get("schema_version") != EVALUATION_REQUEST_SCHEMA:
             raise ValueError("Unsupported evaluation request schema")
         config_value = dict(request["configuration"])
@@ -257,17 +275,13 @@ class EvaluationPipeline:
         candidates: list[dict[str, Any]] = []
         run_ids: set[str] = set()
         adapter_ids: set[str] = set()
-        prediction_identities: set[tuple[str, str]] = set()
+        pairing = self._ensure_pairing()
         for manifest_uri in self.config.publication_manifests:
-            store, key = _resolve_uri(
-                self.storage_runtime,
-                manifest_uri,
-                role_name="artifact",
-            )
+            resolution = resolve_storage_uri(self.storage_runtime, manifest_uri)
+            store, key = resolution.store, resolution.key
             manifest_bytes = _read_uri_bytes(
                 self.storage_runtime,
                 manifest_uri,
-                role_name="artifact",
             )
             manifest_checksum = hashlib.sha256(manifest_bytes).hexdigest()
             manifest = _json_object(manifest_bytes, manifest_uri)
@@ -307,7 +321,6 @@ class EvaluationPipeline:
                 actual = _sha256_uri(
                     self.storage_runtime,
                     uri,
-                    role_name="artifact",
                 )
                 if actual != _normalize_checksum(str(expected)):
                     raise ValueError(f"Artifact checksum mismatch: {uri}")
@@ -320,35 +333,28 @@ class EvaluationPipeline:
             ):
                 raise ValueError("Adapter bundle checksum does not match publication")
 
-            baseline_rows = list(
+            pairing.ingest(
+                adapter_id,
+                "baseline",
                 _iter_uri_jsonl(
                     self.storage_runtime,
                     str(manifest["baseline_predictions_uri"]),
-                    role_name="artifact",
-                )
+                ),
             )
-            trained_rows = list(
+            pairing.ingest(
+                adapter_id,
+                "candidate",
                 _iter_uri_jsonl(
                     self.storage_runtime,
                     str(manifest["trained_predictions_uri"]),
-                    role_name="artifact",
-                )
+                ),
             )
-            for label, rows in (("baseline", baseline_rows), ("trained", trained_rows)):
-                for row in rows:
-                    identity = (run_id, _required_string(row, "dataset_record_id"))
-                    typed_identity = (label, *identity)
-                    if typed_identity in prediction_identities:
-                        raise ValueError(
-                            f"Duplicate prediction identity across publications: {typed_identity}"
-                        )
-                    prediction_identities.add(typed_identity)
-            pairs, issues = pair_predictions(baseline_rows, trained_rows)
+            pairing_summary = pairing.summary(adapter_id)
+            issues = list(pairing.issues(adapter_id))
             lineage_uri = store.uri(f"{root}/dataset-lineage.json")
             lineage = _read_uri_json(
                 self.storage_runtime,
                 lineage_uri,
-                role_name="artifact",
             )
             candidates.append(
                 {
@@ -360,12 +366,25 @@ class EvaluationPipeline:
                     "adapter_id": adapter_id,
                     "dataset_lineage_uri": lineage_uri,
                     "dataset_lineage": lineage,
-                    "pairs": pairs,
+                    "pairing_summary": pairing_summary,
                     "pairing_issues": issues,
                     "adapter_verification": asdict(verification),
                 }
             )
         return candidates
+
+    def _ensure_pairing(self) -> PredictionPairingStore:
+        if self.pairing_store is None:
+            self.pairing_store = PredictionPairingStore()
+        return self.pairing_store
+
+    def _pairs(self, candidate: Mapping[str, Any]) -> Iterator[PredictionPair]:
+        return self._ensure_pairing().iter_pairs(str(candidate["adapter_id"]))
+
+    def _close_pairing(self) -> None:
+        if self.pairing_store is not None:
+            self.pairing_store.close()
+            self.pairing_store = None
 
     def _variant_identity(self, candidates: list[dict[str, Any]]) -> dict[str, Any]:
         dataset_identities = sorted(
@@ -473,7 +492,7 @@ class EvaluationPipeline:
                         "pairing_issues",
                     )
                 }
-                | {"record_count": len(item["pairs"])}
+                | {"record_count": item["pairing_summary"]["record_count"]}
                 for item in candidates
             ],
         }
@@ -485,134 +504,226 @@ class EvaluationPipeline:
     def _deterministic_stage(
         self,
         candidates: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        rows = [
-            deterministic_result(pair, candidate_id=candidate["adapter_id"])
-            for candidate in candidates
-            for pair in candidate["pairs"]
-        ]
-        uri, checksum = self._put_jsonl("deterministic-results.jsonl", rows)
+    ) -> int:
+        count = 0
+
+        def rows() -> Iterator[dict[str, Any]]:
+            nonlocal count
+            for candidate in candidates:
+                for pair in self._pairs(candidate):
+                    count += 1
+                    yield deterministic_result(
+                        pair,
+                        candidate_id=candidate["adapter_id"],
+                    )
+
+        uri, checksum = self._put_jsonl("deterministic-results.jsonl", rows())
         self._checkpoint(
             "deterministic-scoring",
-            row_counts={"deterministic_results": len(rows)},
+            row_counts={"deterministic_results": count},
             artifact_checksums={uri: checksum},
         )
-        return rows
+        return count
 
     def _evidence_stage(
         self,
         candidates: list[dict[str, Any]],
-    ) -> tuple[list[dict[str, Any]], dict[str, dict[str, dict[str, Any]]]]:
-        rows: list[dict[str, Any]] = []
-        by_candidate: dict[str, dict[str, dict[str, Any]]] = {}
-        for candidate in candidates:
-            lookup = self._load_evidence_lookup(candidate["dataset_lineage"])
-            candidate_resolution: dict[str, dict[str, Any]] = {}
-            for pair in candidate["pairs"]:
-                source = pair.candidate or pair.baseline or {}
-                evidence_ids = _string_list(source.get("evidence_ids"))
-                found = [lookup[item] for item in evidence_ids if item in lookup]
-                missing = [item for item in evidence_ids if item not in lookup]
-                if missing and (
-                    self.config.evidence.required
-                    or self.config.evidence.missing_policy == "error"
-                ):
-                    raise ValueError(
-                        f"Required evidence unavailable for {pair.record_id}: {missing}"
-                    )
-                if evidence_ids and found and not missing:
-                    basis = "evidence-grounded"
-                elif self.config.evidence.missing_policy == "unjudgeable":
-                    basis = "unjudgeable"
-                else:
-                    basis = "reference-only"
-                stored_evidence = [
-                    {
-                        "evidence_id": item["evidence_id"],
-                        "content_sha256": item["content_sha256"],
-                        **(
-                            {"text": item["text"]}
-                            if self.config.evidence.store_evidence_text
-                            else {}
-                        ),
+    ) -> int:
+        count = 0
+
+        def rows() -> Iterator[dict[str, Any]]:
+            nonlocal count
+            for candidate in candidates:
+                lookup, resolution_failures, _ = self._load_evidence_lookup(
+                    candidate["dataset_lineage"]
+                )
+                for pair in self._pairs(candidate):
+                    source = pair.candidate or pair.baseline or {}
+                    evidence_ids = _string_list(source.get("evidence_ids"))
+                    found = [lookup[item] for item in evidence_ids if item in lookup]
+                    missing = [item for item in evidence_ids if item not in lookup]
+                    if missing and (
+                        self.config.evidence.required
+                        or self.config.evidence.missing_policy == "error"
+                    ):
+                        raise ValueError(
+                            f"Required evidence unavailable for {pair.record_id}: {missing}"
+                        )
+                    if evidence_ids and found and not missing:
+                        basis = "evidence-grounded"
+                    elif self.config.evidence.missing_policy == "unjudgeable":
+                        basis = "unjudgeable"
+                    else:
+                        basis = "reference-only"
+                    stored_evidence = [
+                        {
+                            "evidence_id": item["evidence_id"],
+                            "content_sha256": item["content_sha256"],
+                            **(
+                                {"text": item["text"]}
+                                if self.config.evidence.store_evidence_text
+                                else {}
+                            ),
+                        }
+                        for item in found
+                    ]
+                    row = {
+                        "candidate_id": candidate["adapter_id"],
+                        "dataset_record_id": pair.record_id,
+                        "judgment_basis": basis,
+                        "evidence_ids": evidence_ids,
+                        "resolved_evidence": stored_evidence,
+                        "missing_evidence_ids": missing,
+                        "resolution_failures": resolution_failures,
                     }
-                    for item in found
-                ]
-                row = {
-                    "candidate_id": candidate["adapter_id"],
-                    "dataset_record_id": pair.record_id,
-                    "judgment_basis": basis,
-                    "evidence_ids": evidence_ids,
-                    "resolved_evidence": stored_evidence,
-                    "missing_evidence_ids": missing,
-                }
-                rows.append(row)
-                candidate_resolution[pair.record_id] = {
-                    **row,
-                    "judge_evidence": found,
-                }
-            by_candidate[candidate["adapter_id"]] = candidate_resolution
-        uri, checksum = self._put_jsonl("evidence-resolution.jsonl", rows)
+                    self._ensure_pairing().put_evidence(
+                        candidate["adapter_id"],
+                        pair.record_id,
+                        {**row, "judge_evidence": found},
+                    )
+                    count += 1
+                    yield row
+
+        uri, checksum = self._put_jsonl("evidence-resolution.jsonl", rows())
         self._checkpoint(
             "evidence-resolution",
-            row_counts={"evidence_resolutions": len(rows)},
+            row_counts={"evidence_resolutions": count},
             artifact_checksums={uri: checksum},
         )
-        return rows, by_candidate
+        return count
 
     def _load_evidence_lookup(
         self,
         lineage: Mapping[str, Any],
-    ) -> dict[str, dict[str, Any]]:
+    ) -> tuple[
+        dict[str, dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+    ]:
+        failures: list[dict[str, Any]] = []
+        resolutions: list[dict[str, Any]] = []
         dataset_uri = lineage.get("dataset_manifest_uri")
         if not isinstance(dataset_uri, str) or not dataset_uri.startswith("storage://"):
-            return {}
-        dataset = _read_uri_json(
-            self.storage_runtime,
+            failures.append(_missing_uri_failure(dataset_uri, "dataset_manifest_uri"))
+            return {}, failures, resolutions
+        dataset = self._resolve_evidence_json(
             dataset_uri,
-            role_name="artifact",
+            failures=failures,
+            resolutions=resolutions,
         )
+        if dataset is None:
+            return {}, failures, resolutions
         source_uri = dataset.get("source_manifest_uri") or lineage.get(
             "source_manifest_uri"
         )
         if not isinstance(source_uri, str) or not source_uri.startswith("storage://"):
-            return {}
-        source = _read_uri_json(
-            self.storage_runtime,
+            failures.append(_missing_uri_failure(source_uri, "source_manifest_uri"))
+            return {}, failures, resolutions
+        source = self._resolve_evidence_json(
             source_uri,
-            role_name="artifact",
+            failures=failures,
+            resolutions=resolutions,
         )
+        if source is None:
+            return {}, failures, resolutions
         refs = source.get("evidence_refs")
         if not isinstance(refs, list):
-            return {}
+            failures.append(
+                {
+                    "uri": source_uri,
+                    "detected_namespace": resolutions[-1]["detected_namespace"],
+                    "selected_role": resolutions[-1]["selected_role"],
+                    "selected_profile": resolutions[-1]["selected_profile"],
+                    "failure_category": "evidence_refs_missing",
+                    "detail": "Ingest manifest does not contain evidence_refs",
+                }
+            )
+            return {}, failures, resolutions
         lookup: dict[str, dict[str, Any]] = {}
         for uri in refs:
             if not isinstance(uri, str) or not uri.startswith("storage://"):
+                failures.append(_missing_uri_failure(uri, "evidence_ref"))
                 continue
-            for item in _iter_uri_jsonl(
-                self.storage_runtime,
-                uri,
-                role_name="artifact",
-            ):
-                evidence_id = item.get("evidence_id") or item.get("id")
-                if evidence_id is None:
-                    continue
-                text = _evidence_text(item)
-                normalized = {
-                    "evidence_id": str(evidence_id),
-                    "text": text,
-                    "content_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            resolution = None
+            try:
+                resolution = resolve_storage_uri(self.storage_runtime, uri)
+                resolutions.append(resolution.describe())
+                for item in _iter_resolved_jsonl(resolution):
+                    evidence_id = item.get("evidence_id") or item.get("id")
+                    if evidence_id is None:
+                        continue
+                    text = _evidence_text(item)
+                    normalized = {
+                        "evidence_id": str(evidence_id),
+                        "text": text,
+                        "content_sha256": hashlib.sha256(
+                            text.encode("utf-8")
+                        ).hexdigest(),
+                    }
+                    existing = lookup.get(str(evidence_id))
+                    if existing is not None and existing != normalized:
+                        raise ValueError(f"Conflicting evidence_id: {evidence_id}")
+                    lookup[str(evidence_id)] = normalized
+            except StorageUriResolutionError as exc:
+                failures.append(exc.to_dict())
+            except Exception as exc:
+                failures.append(
+                    _resolved_failure(
+                        uri,
+                        resolution,
+                        "evidence_artifact_unavailable",
+                        exc,
+                    )
+                )
+        return lookup, failures, resolutions
+
+    def _resolve_evidence_json(
+        self,
+        uri: str,
+        *,
+        failures: list[dict[str, Any]],
+        resolutions: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        resolution = None
+        try:
+            resolution = resolve_storage_uri(self.storage_runtime, uri)
+            resolutions.append(resolution.describe())
+            with resolution.store.open(resolution.key) as source:
+                return _json_object(source.read(), uri)
+        except StorageUriResolutionError as exc:
+            failures.append(exc.to_dict())
+        except Exception as exc:
+            failures.append(
+                _resolved_failure(uri, resolution, "artifact_unavailable", exc)
+            )
+        return None
+
+    def _evidence_resolution_summary(
+        self,
+        candidates: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        summaries = []
+        for candidate in candidates:
+            lookup, failures, resolutions = self._load_evidence_lookup(
+                candidate["dataset_lineage"]
+            )
+            summaries.append(
+                {
+                    "candidate_id": candidate["adapter_id"],
+                    "resolved_evidence_count": len(lookup),
+                    "resolution_failures": failures,
+                    "resolved_uris": resolutions,
                 }
-                existing = lookup.get(str(evidence_id))
-                if existing is not None and existing != normalized:
-                    raise ValueError(f"Conflicting evidence_id: {evidence_id}")
-                lookup[str(evidence_id)] = normalized
-        return lookup
+            )
+        return {
+            "candidate_count": len(summaries),
+            "resolvable": all(not item["resolution_failures"] for item in summaries),
+            "candidates": summaries,
+        }
 
     def _judge_stage(
         self,
         candidates: list[dict[str, Any]],
-        evidence_by_candidate: Mapping[str, Mapping[str, Mapping[str, Any]]],
         judge: JudgeClient,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         results: list[dict[str, Any]] = []
@@ -620,30 +731,23 @@ class EvaluationPipeline:
         completed = 0
         for candidate in candidates:
             candidate_id = candidate["adapter_id"]
-            for pair in candidate["pairs"]:
+            for pair in self._pairs(candidate):
                 result_key = self._row_key("judge-results", candidate_id, pair.record_id)
                 if self.artifact_store.exists(result_key):
                     results.append(_read_store_json(self.artifact_store, result_key))
                     completed += 1
                     continue
-                prior_rejections = []
-                for attempt in range(self.config.maximum_judge_retries + 1):
-                    prior_id = request_id(
-                        str(self.run_id), candidate_id, pair.record_id, attempt
-                    )
-                    prior_key = f"{self.root}/rows/rejections/{prior_id}.json"
-                    if self.artifact_store.exists(prior_key):
-                        prior_rejections.append(
-                            _read_store_json(self.artifact_store, prior_key)
-                        )
-                if prior_rejections and (
-                    prior_rejections[0].get("reason") == "token_budget_exceeded"
-                    or len(prior_rejections)
-                    == self.config.maximum_judge_retries + 1
-                ):
+                next_attempt, terminal, prior_rejections = self._attempt_state(
+                    candidate_id,
+                    pair.record_id,
+                )
+                if terminal:
                     rejections.extend(prior_rejections)
                     continue
-                evidence = evidence_by_candidate[candidate_id][pair.record_id]
+                evidence = self._ensure_pairing().get_evidence(
+                    candidate_id,
+                    pair.record_id,
+                )
                 if evidence["judgment_basis"] == "unjudgeable":
                     row = self._unjudgeable_result(candidate_id, pair)
                     self.artifact_store.put_json_idempotent(result_key, row)
@@ -661,7 +765,7 @@ class EvaluationPipeline:
                     rejection = self._rejection(
                         candidate_id,
                         pair.record_id,
-                        attempt=0,
+                        attempt=next_attempt,
                         reason="token_budget_exceeded",
                         detail=(
                             f"{input_tokens} input + "
@@ -673,7 +777,10 @@ class EvaluationPipeline:
                     rejections.append(rejection)
                     continue
                 accepted: dict[str, Any] | None = None
-                for attempt in range(self.config.maximum_judge_retries + 1):
+                for attempt in range(
+                    next_attempt,
+                    self.config.maximum_judge_retries + 1,
+                ):
                     current_request_id = request_id(
                         str(self.run_id),
                         candidate_id,
@@ -780,6 +887,59 @@ class EvaluationPipeline:
         )
         return results, rejection_rows
 
+    def _attempt_state(
+        self,
+        candidate_id: str,
+        record_id: str,
+    ) -> tuple[int, bool, list[dict[str, Any]]]:
+        used_attempts: set[int] = set()
+        rejections: list[dict[str, Any]] = []
+        terminal = False
+        maximum_attempt = self.config.maximum_judge_retries
+        for attempt in range(maximum_attempt + 1):
+            identity = request_id(
+                str(self.run_id),
+                candidate_id,
+                record_id,
+                attempt,
+            )
+            request_key = f"{self.root}/rows/judge-requests/{identity}.json"
+            rejection_key = f"{self.root}/rows/rejections/{identity}.json"
+            request_exists = self.artifact_store.exists(request_key)
+            rejection_exists = self.artifact_store.exists(rejection_key)
+            if rejection_exists:
+                rejection = _read_store_json(self.artifact_store, rejection_key)
+                rejections.append(rejection)
+                used_attempts.add(attempt)
+                terminal = terminal or (
+                    rejection.get("reason") == "token_budget_exceeded"
+                )
+            elif request_exists:
+                interrupted = self._rejection(
+                    candidate_id,
+                    record_id,
+                    attempt=attempt,
+                    reason="interrupted_judge_attempt",
+                    detail=(
+                        "A durable judge request had no result or rejection; "
+                        "the attempt will not be reused."
+                    ),
+                    request_identity=identity,
+                )
+                self._put_attempt("rejections", identity, interrupted)
+                rejections.append(interrupted)
+                used_attempts.add(attempt)
+        next_attempt = next(
+            (
+                attempt
+                for attempt in range(maximum_attempt + 1)
+                if attempt not in used_attempts
+            ),
+            maximum_attempt + 1,
+        )
+        exhausted = next_attempt > maximum_attempt
+        return next_attempt, terminal or exhausted, rejections
+
     def _messages(
         self,
         pair: PredictionPair,
@@ -844,7 +1004,6 @@ class EvaluationPipeline:
     def _aggregation_stage(
         self,
         candidates: list[dict[str, Any]],
-        deterministic_rows: list[dict[str, Any]],
         judgment_rows: list[dict[str, Any]],
         rejection_rows: list[dict[str, Any]],
     ) -> dict[str, Any]:
@@ -852,9 +1011,17 @@ class EvaluationPipeline:
         record_sets: dict[str, set[str]] = {}
         for candidate in candidates:
             candidate_id = candidate["adapter_id"]
-            candidate_deterministic = [
-                row for row in deterministic_rows if row["candidate_id"] == candidate_id
-            ]
+            deterministic_uri = self.artifact_store.uri(
+                f"{self.root}/deterministic-results.jsonl"
+            )
+            candidate_deterministic = (
+                row
+                for row in _iter_uri_jsonl(
+                    self.storage_runtime,
+                    deterministic_uri,
+                )
+                if row["candidate_id"] == candidate_id
+            )
             candidate_judgments = [
                 row for row in judgment_rows if row["candidate_id"] == candidate_id
             ]
@@ -947,8 +1114,8 @@ class EvaluationPipeline:
         self,
         *,
         candidates: list[dict[str, Any]],
-        deterministic_rows: list[dict[str, Any]],
-        evidence_rows: list[dict[str, Any]],
+        deterministic_count: int,
+        evidence_count: int,
         judgment_rows: list[dict[str, Any]],
         rejection_rows: list[dict[str, Any]],
         aggregate: Mapping[str, Any],
@@ -974,7 +1141,6 @@ class EvaluationPipeline:
             filename: _sha256_uri(
                 self.storage_runtime,
                 uri,
-                role_name="artifact",
             )
             for filename, uri in artifact_uris.items()
         }
@@ -992,8 +1158,8 @@ class EvaluationPipeline:
             "artifacts": artifact_uris,
             "artifact_checksums": artifact_checksums,
             "row_counts": {
-                "deterministic_results": len(deterministic_rows),
-                "evidence_resolutions": len(evidence_rows),
+                "deterministic_results": deterministic_count,
+                "evidence_resolutions": evidence_count,
                 "judge_results": len(judgment_rows),
                 "rejections": len(rejection_rows),
             },
@@ -1115,7 +1281,6 @@ class EvaluationPipeline:
                 _read_uri_json(
                     self.storage_runtime,
                     item.uri,
-                    role_name="artifact",
                 )
             )
         return sorted(rows, key=lambda row: str(row.get("request_id", "")))
@@ -1168,7 +1333,7 @@ def show_evaluation(
     storage_runtime: Any | None = None,
 ) -> dict[str, Any]:
     runtime = resolve_storage_runtime(storage_runtime=storage_runtime)
-    manifest = _read_uri_json(runtime, evaluation_manifest_uri, role_name="artifact")
+    manifest = _read_uri_json(runtime, evaluation_manifest_uri)
     if manifest.get("schema_version") != EVALUATION_MANIFEST_SCHEMA:
         raise ValueError("Unsupported evaluation manifest schema")
     return {
@@ -1180,26 +1345,14 @@ def show_evaluation(
     }
 
 
-def _resolve_uri(runtime: Any, uri: str, *, role_name: str) -> tuple[Any, str]:
-    parsed = urlparse(uri)
-    if parsed.scheme != "storage" or not parsed.netloc:
-        raise ValueError(f"Expected provider-neutral storage:// URI: {uri}")
-    store = runtime.for_profile(parsed.netloc, role_name=role_name)
-    key = parsed.path.lstrip("/")
-    namespace = getattr(store, "namespace", "").strip("/")
-    if namespace and key.startswith(namespace + "/"):
-        key = key[len(namespace) + 1 :]
-    return store, key
-
-
-def _read_uri_bytes(runtime: Any, uri: str, *, role_name: str) -> bytes:
-    store, key = _resolve_uri(runtime, uri, role_name=role_name)
-    with store.open(key) as source:
+def _read_uri_bytes(runtime: Any, uri: str) -> bytes:
+    resolution = resolve_storage_uri(runtime, uri)
+    with resolution.store.open(resolution.key) as source:
         return source.read()
 
 
-def _read_uri_json(runtime: Any, uri: str, *, role_name: str) -> dict[str, Any]:
-    return _json_object(_read_uri_bytes(runtime, uri, role_name=role_name), uri)
+def _read_uri_json(runtime: Any, uri: str) -> dict[str, Any]:
+    return _json_object(_read_uri_bytes(runtime, uri), uri)
 
 
 def _read_store_json(store: Any, key: str) -> dict[str, Any]:
@@ -1217,23 +1370,26 @@ def _json_object(content: bytes, source: str) -> dict[str, Any]:
 def _iter_uri_jsonl(
     runtime: Any,
     uri: str,
-    *,
-    role_name: str,
 ) -> Iterator[dict[str, Any]]:
-    store, key = _resolve_uri(runtime, uri, role_name=role_name)
-    with store.open(key) as source:
+    yield from _iter_resolved_jsonl(resolve_storage_uri(runtime, uri))
+
+
+def _iter_resolved_jsonl(resolution: Any) -> Iterator[dict[str, Any]]:
+    with resolution.store.open(resolution.key) as source:
         for line_number, raw in enumerate(source, start=1):
             if not raw.strip():
                 continue
             value = json.loads(raw)
             if not isinstance(value, dict):
-                raise ValueError(f"{uri}:{line_number} must be a JSON object")
+                raise ValueError(
+                    f"{resolution.uri}:{line_number} must be a JSON object"
+                )
             yield value
 
 
-def _sha256_uri(runtime: Any, uri: str, *, role_name: str) -> str:
-    store, key = _resolve_uri(runtime, uri, role_name=role_name)
-    with store.open(key) as source:
+def _sha256_uri(runtime: Any, uri: str) -> str:
+    resolution = resolve_storage_uri(runtime, uri)
+    with resolution.store.open(resolution.key) as source:
         return _sha256_stream(source)
 
 
@@ -1242,6 +1398,41 @@ def _sha256_stream(source: Any) -> str:
     for chunk in iter(lambda: source.read(1024 * 1024), b""):
         hasher.update(chunk)
     return hasher.hexdigest()
+
+
+def _missing_uri_failure(value: Any, field: str) -> dict[str, Any]:
+    return {
+        "uri": value if isinstance(value, str) else None,
+        "detected_namespace": None,
+        "selected_role": None,
+        "selected_profile": None,
+        "failure_category": "missing_or_invalid_uri",
+        "detail": f"{field} must be a storage:// URI",
+    }
+
+
+def _resolved_failure(
+    uri: str,
+    resolution: Any,
+    category: str,
+    exc: BaseException,
+) -> dict[str, Any]:
+    description = (
+        resolution.describe()
+        if resolution is not None
+        else {
+            "detected_namespace": None,
+            "selected_role": None,
+            "selected_profile": None,
+            "shared_compatibility": False,
+        }
+    )
+    return {
+        **description,
+        "uri": uri,
+        "failure_category": category,
+        "detail": str(exc),
+    }
 
 
 def _required_string(value: Mapping[str, Any], field: str) -> str:

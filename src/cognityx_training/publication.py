@@ -13,7 +13,6 @@ import shutil
 import subprocess
 import tempfile
 from typing import Any, Iterable, Mapping
-from urllib.parse import urlparse
 
 from cognityx_training.lineage import (
     TrainingLineageIds,
@@ -21,6 +20,7 @@ from cognityx_training.lineage import (
     variant_identity_checksum,
 )
 from cognityx_training.reporting import utc_now
+from cognityx_training.storage_uri import resolve_storage_uri
 
 ADAPTER_SCHEMA = "cognityx.training.adapter/v1"
 EXPERIMENT_SCHEMA = "cognityx.training.experiment/v1"
@@ -223,30 +223,20 @@ def _read_json(store: Any, key: str) -> dict[str, Any]:
     return value
 
 
-def _store_key_for_uri(store: Any, uri: str) -> str:
-    parsed = urlparse(uri)
-    if parsed.scheme != "storage":
-        raise ValueError(f"Expected storage:// URI, got: {uri}")
-    key = parsed.path.lstrip("/")
-    namespace = getattr(store, "namespace", "").strip("/")
-    if namespace and key.startswith(namespace + "/"):
-        key = key[len(namespace) + 1 :]
-    return key
-
-
 def verify_published_adapter(
     adapter_manifest_uri: str,
     *,
     storage_runtime: Any,
 ) -> AdapterVerificationResult:
     """Verify a stored PEFT adapter without loading a model or GPU."""
-    parsed = urlparse(adapter_manifest_uri)
-    if parsed.scheme != "storage" or not parsed.netloc:
+    resolution = resolve_storage_uri(storage_runtime, adapter_manifest_uri)
+    if resolution.selected_role not in {"model", "shared"}:
         raise ValueError(
-            f"Adapter manifest must use a provider-neutral storage:// URI: {adapter_manifest_uri}"
+            "Adapter manifest URI must resolve through the model role or "
+            f"legacy shared scope, got {resolution.selected_role}"
         )
-    store = storage_runtime.for_profile(parsed.netloc, role_name="model")
-    manifest_key = _store_key_for_uri(store, adapter_manifest_uri)
+    store = resolution.store
+    manifest_key = resolution.key
     manifest = _read_json(store, manifest_key)
     if manifest.get("schema_version") != ADAPTER_SCHEMA:
         raise ValueError("Unsupported adapter manifest schema")
