@@ -66,6 +66,7 @@ def main(argv: list[str] | None = None) -> None:
     experiment_values = values.get("experiment", {})
     publication_values = values.get("publication", {})
     dataset_values = values.get("dataset", {})
+    tracking_values = values.get("tracking", {})
     config = CustomPyTorchTrainingConfig.from_mapping(
         {
             **training,
@@ -79,6 +80,12 @@ def main(argv: list[str] | None = None) -> None:
                 "retain_local_staging",
                 False,
             ),
+            "tracking_backend": tracking_values.get("backend", "none"),
+            "tracking_uri": tracking_values.get("uri"),
+            "tracking_experiment_name": tracking_values.get("experiment_name"),
+            "tracking_run_name": tracking_values.get("run_name"),
+            "tracking_parent_run_id": tracking_values.get("parent_run_id"),
+            "tracking_failure_policy": tracking_values.get("failure_policy", "warn"),
         }
     )
     if (

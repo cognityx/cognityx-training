@@ -1,0 +1,29 @@
+[training]
+backend = "custom-pytorch"
+model_name = "Qwen/Qwen3-8B"
+model_cache_dir = "/mnt/d/AI/models/huggingface/hub"
+local_files_only = true
+output_dir = "/mnt/d/AI/models/cognityx/training/research-package"
+dataset_input_mode = "dataforge_manifest"
+max_steps = 1
+max_sequence_length = 512
+evaluation_max_new_tokens = 32
+data_order = "source"
+
+[experiment]
+id = "exp-dataforge-qualification"
+name = "Raw versus qualified paragraph data"
+description = "Controlled comparison using one frozen DataForge research package"
+
+[publication]
+mode = "storage"
+retain_local_staging = false
+
+[tracking]
+backend = "none"
+failure_policy = "warn"
+
+[dataset]
+name = "qualified-paragraph-research"
+version = "1"
+uri = "storage://local-main/datasets/dataforge/research-packages/replace-me/manifest.json"

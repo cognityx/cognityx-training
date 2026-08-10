@@ -2,6 +2,10 @@
 
 Training backends and dataset-to-instruction-fine-tuning pipelines for Cognityx.
 
+Training sits after DataForge: it reads a verified dataset or research package,
+uses only records explicitly eligible for training, evaluates frozen test-only
+suites before and after optimization, and publishes the adapter plus evidence.
+
 The first vertical slice provides `CustomPyTorchTrainerBackend`, a one-step
 PyTorch `DataLoader`/`AdamW` loop using Transformers for Qwen loading and PEFT
 for LoRA or QLoRA adapters. The default model is `Qwen/Qwen3-14B`; override
@@ -27,6 +31,12 @@ Trained adapters are also written under `D:\AI\models`, using:
 
 ```bash
 uv sync --extra training
+```
+
+Add the optional tracker integration only when needed:
+
+```bash
+uv sync --extra training --extra tracking
 ```
 
 For Hugging Face tools outside this application, select the same cache root:
@@ -86,6 +96,9 @@ uv run --extra training cognityx-train \
 
 The benefit experiment compares held-out answers from the untrained base model
 and trained adapter. See [the two-phase validation guide](docs/two-phase-validation.md).
+
+For qualification comparisons and optional MLflow indexing, see
+[research packages and tracking](docs/research-tracking.md).
 
 ## Automatic capacity search
 

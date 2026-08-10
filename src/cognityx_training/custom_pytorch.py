@@ -41,6 +41,7 @@ from cognityx_training.reporting import (
 )
 from cognityx_training.telemetry import query_host, query_nvidia_gpus
 from cognityx_training.storage_runtime import resolve_storage_runtime
+from cognityx_training.tracking import completed_run_payload, track_configured_run
 
 
 _PERSISTENT_MODEL_CACHE: dict[tuple[Any, ...], tuple[Any, Any]] = {}
@@ -118,20 +119,30 @@ def _evaluate_model(
             messages = record.messages if hasattr(record, "messages") else record["messages"]
             prompt = next(item["content"] for item in reversed(messages) if item["role"] == "user")
             expected = next(item["content"] for item in reversed(messages) if item["role"] == "assistant")
-            input_ids = tokenizer.apply_chat_template(
+            inputs = tokenizer.apply_chat_template(
                 [{"role": "user", "content": prompt}],
                 tokenize=True,
                 add_generation_prompt=True,
                 return_tensors="pt",
-            ).to(input_device)
+                return_dict=True,
+            )
+            if not hasattr(inputs, "items"):
+                raise TypeError("Evaluation chat template must return a BatchEncoding-like mapping")
+            inputs = {
+                key: value.to(input_device) if hasattr(value, "to") else value
+                for key, value in inputs.items()
+            }
+            if "input_ids" not in inputs:
+                raise ValueError("Evaluation chat template did not return input_ids")
+            input_length = inputs["input_ids"].shape[-1]
             output_ids = model.generate(
-                input_ids=input_ids,
+                **inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
             )
             generated = tokenizer.decode(
-                output_ids[0, input_ids.shape[-1] :], skip_special_tokens=True
+                output_ids[0, input_length:], skip_special_tokens=True
             ).strip()
             normalized_expected = " ".join(expected.lower().split())
             normalized_generated = " ".join(generated.lower().split())
@@ -157,6 +168,19 @@ def _evaluate_model(
     if was_training:
         model.train()
     count = len(results)
+    suites: dict[str, dict[str, Any]] = {}
+    suite_rows: dict[str, list[dict[str, Any]]] = {}
+    for row in results:
+        role = str(row.get("metadata", {}).get("research_role") or "legacy_evaluation")
+        suite_rows.setdefault(role, []).append(row)
+    for role, rows in sorted(suite_rows.items()):
+        suite_count = len(rows)
+        suites[role] = {
+            "example_count": suite_count,
+            "exact_match_accuracy": sum(item["exact_match"] for item in rows) / suite_count,
+            "contains_expected_accuracy": sum(item["contains_expected"] for item in rows) / suite_count,
+            "record_ids": [item.get("record_id") for item in rows],
+        }
     return {
         "example_count": count,
         "exact_match_accuracy": (
@@ -165,6 +189,7 @@ def _evaluate_model(
         "contains_expected_accuracy": (
             sum(item["contains_expected"] for item in results) / count if count else None
         ),
+        "suite_metrics": suites,
         "outputs": results,
     }
 
@@ -437,9 +462,13 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
         losses: list[float] = []
         step_times: list[float] = []
         completed_steps = 0
+        training_input_tokens_processed = 0
+        training_target_tokens_processed = 0
         while completed_steps < self.config.max_steps:
             for batch in loader:
                 step_started = time.perf_counter()
+                training_input_tokens_processed += int(batch["attention_mask"].sum().item())
+                training_target_tokens_processed += int((batch["labels"] != -100).sum().item())
                 outputs = model(
                     input_ids=batch["input_ids"].to(input_device),
                     attention_mask=batch["attention_mask"].to(input_device),
@@ -494,9 +523,12 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
             "train_steps": completed_steps,
             "train_runtime_seconds": runtime_seconds,
             "training_examples": preflight.statistics.accepted_training_examples,
+            "training_input_tokens_processed": training_input_tokens_processed,
+            "training_target_tokens_processed": training_target_tokens_processed,
             "dataset_examples_available": preflight.statistics.total_records,
             "dataset_examples_selected": preflight.statistics.selected_training_candidates,
             "evaluation_examples": preflight.statistics.evaluation_records,
+            "evaluation_suite_counts": dict(preflight.statistics.evaluation_suite_counts),
             "micro_batch_size": self.config.per_device_train_batch_size,
             "gradient_accumulation_steps": self.config.gradient_accumulation_steps,
             "effective_batch_size": (
@@ -569,7 +601,21 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
                     "source_manifest_checksum": preflight.lineage.source_manifest_checksum,
                     "configuration_checksum": preflight.lineage.configuration_checksum,
                     "split_summary": preflight.statistics.split_summary,
-                    "record_counts": preflight.lineage.record_counts,
+                    "record_counts": {
+                        "total": preflight.statistics.total_records,
+                        "training": preflight.statistics.training_records,
+                        "evaluation": preflight.statistics.evaluation_records,
+                        "selected_training_candidates": preflight.statistics.selected_training_candidates,
+                        "accepted_training_examples": preflight.statistics.accepted_training_examples,
+                        "skipped_overlength": preflight.statistics.skipped_overlength_count,
+                    },
+                    "evaluation_suite_counts": dict(preflight.statistics.evaluation_suite_counts),
+                    "manifest_record_counts": preflight.lineage.record_counts,
+                    "research_package_manifest_uri": preflight.lineage.research_package_manifest_uri,
+                    "research_package_manifest_checksum": preflight.lineage.research_package_manifest_checksum,
+                    "research_package_id": preflight.lineage.research_package_id,
+                    "research_package_version": preflight.lineage.research_package_version,
+                    "evaluation_sets": list(preflight.lineage.evaluation_sets),
                     "overlength_policy": preflight.lineage.overlength_policy,
                     "skipped_records": list(
                         preflight.statistics.skipped_record_samples
@@ -650,6 +696,8 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
             )
         report["base_model_reuse"] = cleanup
         metrics.update(ids.to_dict())
+        tracking_references: dict[str, Any]
+        tracking_checksums: dict[str, Any]
         if publisher is not None:
             self._publication_phase = "storage-publication"
             decoding = {
@@ -708,10 +756,56 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
                 }
             )
             report_uri = publication.training_report_uri
+            tracking_references = {
+                "publication_manifest_uri": publication.publication_manifest_uri,
+                "adapter_uri": publication.adapter_uri,
+                "adapter_manifest_uri": publication.adapter_manifest_uri,
+                "training_report_uri": publication.training_report_uri,
+                "baseline_predictions_uri": publication.baseline_predictions_uri,
+                "trained_predictions_uri": publication.trained_predictions_uri,
+                "dataset_manifest_uri": preflight.lineage.dataset_manifest_uri,
+                "research_package_manifest_uri": preflight.lineage.research_package_manifest_uri,
+            }
+            tracking_checksums = dict(publication.artifact_checksums)
         else:
             report_path = write_training_report(report, output_dir)
             report_uri = report_path.resolve().as_uri()
             metrics["report_uri"] = report_uri
+            tracking_references = {
+                "training_report_uri": report_uri,
+                "adapter_uri": artifact.uri,
+                "dataset_manifest_uri": preflight.lineage.dataset_manifest_uri,
+                "research_package_manifest_uri": preflight.lineage.research_package_manifest_uri,
+            }
+            tracking_checksums = {
+                "dataset_records": preflight.lineage.records_checksum,
+                "research_package_manifest": preflight.lineage.research_package_manifest_checksum,
+            }
+        tracking_payload = completed_run_payload(
+            identity=ids.to_dict(),
+            parameters=variant_identity,
+            metrics=metrics,
+            resources={
+                "system_usage": report["system_usage"],
+                "gpu_usage": report["gpu_usage"],
+            },
+            artifact_references=tracking_references,
+            artifact_checksums=tracking_checksums,
+        )
+        tracking_result = track_configured_run(
+            tracking_payload,
+            backend=self.config.tracking_backend,
+            tracking_uri=self.config.tracking_uri,
+            experiment_name=self.config.tracking_experiment_name,
+            run_name=self.config.tracking_run_name,
+            parent_run_id=self.config.tracking_parent_run_id,
+            failure_policy=self.config.tracking_failure_policy,
+        )
+        metrics.update({
+            "tracking_backend": tracking_result.backend,
+            "tracking_status": tracking_result.status,
+            "tracking_external_run_id": tracking_result.external_run_id,
+        })
         try:
             return TrainingResult(
                 artifact=artifact,

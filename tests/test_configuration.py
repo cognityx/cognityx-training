@@ -66,5 +66,11 @@ def test_invalid_training_configuration_fails_before_loading_model() -> None:
     with pytest.raises(ValueError, match="publication_mode"):
         CustomPyTorchTrainingConfig(publication_mode="fallback").validate()
 
+    with pytest.raises(ValueError, match="tracking_backend"):
+        CustomPyTorchTrainingConfig(tracking_backend="custom").validate()
+
+    with pytest.raises(ValueError, match="tracking_experiment_name"):
+        CustomPyTorchTrainingConfig(tracking_backend="mlflow").validate()
+
     with pytest.raises(ValueError, match="exp-"):
         CustomPyTorchTrainingConfig(experiment_id="../unsafe").validate()

@@ -64,6 +64,12 @@ class CustomPyTorchTrainingConfig(BackendConfig):
     host_telemetry_source: str = "auto"
     host_installed_memory_gib: float | None = None
     nvidia_smi_path: str = "nvidia-smi"
+    tracking_backend: str = "none"
+    tracking_uri: str | None = None
+    tracking_experiment_name: str | None = None
+    tracking_run_name: str | None = None
+    tracking_parent_run_id: str | None = None
+    tracking_failure_policy: str = "warn"
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> "CustomPyTorchTrainingConfig":
@@ -129,6 +135,12 @@ class CustomPyTorchTrainingConfig(BackendConfig):
             raise ValueError("overlength_policy must be error or skip.")
         if self.data_order != "source":
             raise ValueError("data_order currently supports only source.")
+        if self.tracking_backend not in {"none", "mlflow"}:
+            raise ValueError("tracking_backend must be none or mlflow.")
+        if self.tracking_failure_policy not in {"warn", "error"}:
+            raise ValueError("tracking_failure_policy must be warn or error.")
+        if self.tracking_backend == "mlflow" and not self.tracking_experiment_name:
+            raise ValueError("tracking_experiment_name is required for MLflow tracking.")
         if not self.model_cache_dir.is_dir():
             raise ValueError(
                 f"Hugging Face model cache does not exist: {self.model_cache_dir}"

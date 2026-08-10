@@ -10,7 +10,9 @@ from typing import Any, Iterable, Iterator, Sequence
 from urllib.parse import urlparse
 
 DATASET_INPUT_MODES = {"auto", "dataforge_manifest", "legacy_jsonl"}
-SUPPORTED_SPLITS = {"train", "eval", "evaluation"}
+SUPPORTED_SPLITS = {"train", "validation", "test", "eval", "evaluation"}
+RESEARCH_PACKAGE_SCHEMA = "cognityx.dataforge.research-package/v1"
+EVALUATION_SET_SCHEMA = "cognityx.dataforge.evaluation-set/v1"
 DEFAULT_SKIPPED_SAMPLE_LIMIT = 10
 
 
@@ -56,6 +58,11 @@ class DatasetLineage:
     record_counts: dict[str, int] = field(default_factory=dict)
     overlength_policy: str = "error"
     skipped_records: list[dict[str, Any]] = field(default_factory=list)
+    research_package_manifest_uri: str | None = None
+    research_package_manifest_checksum: str | None = None
+    research_package_id: str | None = None
+    research_package_version: str | None = None
+    evaluation_sets: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +77,7 @@ class DatasetStatistics:
     maximum_accepted_token_length: int | None
     configured_max_sequence_length: int | None
     split_summary: dict[str, int]
+    evaluation_suite_counts: dict[str, int] = field(default_factory=dict)
     skipped_record_samples: tuple[dict[str, Any], ...] = ()
     skipped_record_sample_limit: int = DEFAULT_SKIPPED_SAMPLE_LIMIT
     warnings: tuple[str, ...] = ()
@@ -123,7 +131,7 @@ def _normalize_split(split: Any, *, record_id: str | None, line_number: int, sou
         raise ValueError(
             f"{source_uri or 'dataset'}:{line_number} record {record_id or '?'} has unsupported split '{split}'"
         )
-    return "evaluation" if value in {"eval", "evaluation"} else "train"
+    return "evaluation" if value in {"validation", "test", "eval", "evaluation"} else "train"
 
 
 def _normalize_messages(record: dict[str, Any], *, source_uri: str | None, line_number: int) -> tuple[dict[str, str], ...]:
@@ -149,8 +157,8 @@ def _normalize_messages(record: dict[str, Any], *, source_uri: str | None, line_
         if assistant_count == 0:
             raise ValueError(f"{source_uri or 'dataset'}:{line_number} requires at least one assistant message")
         return tuple(normalized)
-    instruction = record.get("instruction") or record.get("prompt")
-    output = record.get("output") or record.get("response")
+    instruction = record.get("instruction") or record.get("prompt") or record.get("question")
+    output = record.get("output") or record.get("response") or record.get("gold_reference")
     if not isinstance(instruction, str) or not instruction.strip():
         raise ValueError(f"{source_uri or 'dataset'}:{line_number} requires instruction/prompt text")
     if not isinstance(output, str) or not output.strip():
@@ -163,6 +171,27 @@ def _normalize_messages(record: dict[str, Any], *, source_uri: str | None, line_
 
 def normalize_record(record: dict[str, Any], *, source_uri: str | None, line_number: int) -> NormalizedRecord:
     record_id = record.get("record_id")
+    raw_split = "train" if record.get("split") is None else str(record.get("split")).strip().lower()
+    metadata = dict(record.get("metadata") or {})
+    for name in (
+        "research_role",
+        "training_eligible",
+        "evaluation_set_id",
+        "evaluation_set_version",
+        "source_record_id",
+        "source_reference_id",
+        "fact_group_id",
+        "knowledge_unit_id",
+        "variant_id",
+        "record_provenance",
+        "source_evidence",
+    ):
+        if name in record and name not in metadata:
+            metadata[name] = record[name]
+    if raw_split in {"validation", "test"}:
+        metadata.setdefault("original_split", raw_split)
+        metadata.setdefault("research_role", f"legacy_{raw_split}")
+        metadata.setdefault("training_eligible", False)
     return NormalizedRecord(
         record_id=str(record_id) if record_id is not None else None,
         messages=_normalize_messages(record, source_uri=source_uri, line_number=line_number),
@@ -172,7 +201,7 @@ def normalize_record(record: dict[str, Any], *, source_uri: str | None, line_num
             line_number=line_number,
             source_uri=source_uri,
         ),
-        metadata=dict(record.get("metadata") or {}),
+        metadata=metadata,
         line_number=line_number,
         source_uri=source_uri,
     )
@@ -226,6 +255,28 @@ def resolve_dataset_source(
 
 
 def _split_manifest_fields(manifest: dict[str, Any]) -> dict[str, Any]:
+    split_summary = dict(manifest.get("split_summary") or {})
+    if not split_summary:
+        for name, field_name in (
+            ("train", "train_count"),
+            ("validation", "validation_count"),
+            ("test", "test_count"),
+        ):
+            if manifest.get(field_name) is not None:
+                split_summary[name] = int(manifest[field_name])
+        if manifest.get("eval_count") is not None:
+            split_summary["evaluation_total"] = int(manifest["eval_count"])
+    record_counts = dict(manifest.get("record_counts") or {})
+    if not record_counts:
+        for name, field_name in (
+            ("accepted", "accepted_count"),
+            ("candidates", "candidate_count"),
+            ("rejected", "rejected_count"),
+            ("needs_review", "needs_review_count"),
+            ("duplicates", "duplicate_count"),
+        ):
+            if manifest.get(field_name) is not None:
+                record_counts[name] = int(manifest[field_name])
     return {
         "dataset_id": manifest.get("dataset_id"),
         "dataset_name": manifest.get("dataset_name"),
@@ -239,8 +290,8 @@ def _split_manifest_fields(manifest: dict[str, Any]) -> dict[str, Any]:
         "source_manifest_uri": manifest.get("source_manifest_uri"),
         "source_manifest_checksum": normalize_checksum(manifest.get("source_manifest_checksum")),
         "configuration_checksum": normalize_checksum(manifest.get("configuration_checksum")),
-        "split_summary": dict(manifest.get("split_summary") or {}),
-        "record_counts": dict(manifest.get("record_counts") or {}),
+        "split_summary": split_summary,
+        "record_counts": record_counts,
         "overlength_policy": str(manifest.get("overlength_policy", "error")),
         "skipped_records": list(manifest.get("skipped_records") or []),
     }
@@ -267,6 +318,12 @@ def _records_key_from_uri(records_uri: str, runtime: Any) -> tuple[Any, str]:
     if namespace and key.startswith(namespace + "/"):
         key = key[len(namespace) + 1 :]
     return store, key
+
+
+def _json_from_uri(uri: str, runtime: Any) -> tuple[dict[str, Any], str]:
+    store, key = _records_key_from_uri(uri, runtime)
+    value = _load_json_object(store, key)
+    return value, dataforge_checksum(value)
 
 
 def _stream_records(store: Any, key: str, *, source_uri: str | None) -> Iterator[NormalizedRecord]:
@@ -299,13 +356,52 @@ class DataForgeDatasetReader:
         )
         self._manifest: dict[str, Any] | None = None
         self._manifest_checksum: str | None = None
+        self._research_package: dict[str, Any] | None = None
+        self._research_package_checksum: str | None = None
+        self._evaluation_manifests: list[tuple[str, dict[str, Any]]] = []
 
     def _load_manifest(self) -> tuple[dict[str, Any], str]:
         if self.mode != "dataforge_manifest":
             raise ValueError("Legacy JSONL datasets do not have a DataForge manifest")
         assert self._source is not None and self._context is not None
-        manifest = _load_json_object(self._source, self._context["key"])
-        checksum = dataforge_checksum(manifest)
+        selected = _load_json_object(self._source, self._context["key"])
+        selected_checksum = dataforge_checksum(selected)
+        if selected.get("schema") == RESEARCH_PACKAGE_SCHEMA:
+            runtime = self._context["runtime"]
+            dataset_ref = selected.get("dataset")
+            if not isinstance(dataset_ref, dict) or not dataset_ref.get("manifest_uri"):
+                raise ValueError("Research package requires one dataset manifest reference")
+            manifest, checksum = _json_from_uri(str(dataset_ref["manifest_uri"]), runtime)
+            if manifest.get("schema_version") != "cognityx.dataforge.dataset/v1":
+                raise ValueError("Research package dataset must use cognityx.dataforge.dataset/v1")
+            if manifest.get("records_checksum") != dataset_ref.get("records_checksum"):
+                raise ValueError("Research package dataset records checksum does not match its dataset manifest")
+            evaluation_manifests: list[tuple[str, dict[str, Any]]] = []
+            roles: set[str] = set()
+            for item in selected.get("evaluation_sets", []):
+                if not isinstance(item, dict) or not item.get("manifest_uri"):
+                    raise ValueError("Research package contains a malformed evaluation-set reference")
+                uri = str(item["manifest_uri"])
+                evaluation_manifest, _ = _json_from_uri(uri, runtime)
+                if evaluation_manifest.get("schema") != EVALUATION_SET_SCHEMA:
+                    raise ValueError(f"Unsupported evaluation-set schema at {uri}")
+                role = str(evaluation_manifest.get("research_role"))
+                if role in roles:
+                    raise ValueError(f"Research package repeats evaluation role: {role}")
+                roles.add(role)
+                if evaluation_manifest.get("training_eligible") is not False:
+                    raise ValueError(f"Evaluation set {role} is marked trainable")
+                if evaluation_manifest.get("records_checksum") != item.get("records_checksum"):
+                    raise ValueError(f"Research package checksum mismatch for evaluation role {role}")
+                evaluation_manifests.append((uri, evaluation_manifest))
+            if "exact_recall" not in roles:
+                raise ValueError("Research package requires an exact_recall evaluation set")
+            self._research_package = selected
+            self._research_package_checksum = selected_checksum
+            self._evaluation_manifests = evaluation_manifests
+        else:
+            manifest = selected
+            checksum = selected_checksum
         self._manifest = manifest
         self._manifest_checksum = checksum
         return manifest, checksum
@@ -331,7 +427,8 @@ class DataForgeDatasetReader:
             )
         manifest = self.manifest()
         fields = _split_manifest_fields(manifest)
-        manifest_uri = fields["dataset_manifest_uri"] or self.dataset_uri
+        package_dataset = self._research_package.get("dataset", {}) if self._research_package else {}
+        manifest_uri = fields["dataset_manifest_uri"] or package_dataset.get("manifest_uri") or self.dataset_uri
         return DatasetLineage(
             dataset_id=fields["dataset_id"],
             dataset_name=fields["dataset_name"],
@@ -349,6 +446,22 @@ class DataForgeDatasetReader:
             record_counts=fields["record_counts"],
             overlength_policy=fields["overlength_policy"],
             skipped_records=fields["skipped_records"],
+            research_package_manifest_uri=self.dataset_uri if self._research_package else None,
+            research_package_manifest_checksum=self._research_package_checksum,
+            research_package_id=(self._research_package or {}).get("research_package_id"),
+            research_package_version=(self._research_package or {}).get("research_package_version"),
+            evaluation_sets=tuple(
+                {
+                    "manifest_uri": uri,
+                    "evaluation_set_id": item.get("evaluation_set_id"),
+                    "evaluation_set_version": item.get("evaluation_set_version"),
+                    "research_role": item.get("research_role"),
+                    "records_uri": item.get("records_uri"),
+                    "records_checksum": item.get("records_checksum"),
+                    "record_count": item.get("record_count"),
+                }
+                for uri, item in self._evaluation_manifests
+            ),
         )
 
     def iter_records(self) -> Iterator[NormalizedRecord]:
@@ -368,29 +481,67 @@ class DataForgeDatasetReader:
             checksum = incremental_dataforge_checksum(handle)
         if checksum != records_checksum:
             raise ValueError(f"Records checksum mismatch for {records_uri}")
-        yield from _stream_records(store, key, source_uri=records_uri)
+        seen_record_ids: set[str] = set()
+        for record in _stream_records(store, key, source_uri=records_uri):
+            if record.record_id is not None:
+                if record.record_id in seen_record_ids:
+                    raise ValueError(f"Duplicate record_id in research input: {record.record_id}")
+                seen_record_ids.add(record.record_id)
+            yield record
+        for manifest_uri, evaluation_manifest in self._evaluation_manifests:
+            evaluation_uri = str(evaluation_manifest["records_uri"])
+            evaluation_checksum = normalize_checksum(evaluation_manifest.get("records_checksum"))
+            evaluation_store, evaluation_key = _records_key_from_uri(evaluation_uri, runtime)
+            with evaluation_store.open(evaluation_key) as handle:
+                calculated = incremental_dataforge_checksum(handle)
+            if calculated != evaluation_checksum:
+                raise ValueError(f"Records checksum mismatch for {evaluation_uri}")
+            count = 0
+            for record in _stream_records(evaluation_store, evaluation_key, source_uri=evaluation_uri):
+                count += 1
+                if record.record_id is not None:
+                    if record.record_id in seen_record_ids:
+                        raise ValueError(f"Duplicate record_id in research input: {record.record_id}")
+                    seen_record_ids.add(record.record_id)
+                if record.split != "evaluation" or record.metadata.get("training_eligible") is not False:
+                    raise ValueError(f"Evaluation record {record.record_id or count} from {manifest_uri} is trainable")
+                if record.metadata.get("research_role") != evaluation_manifest.get("research_role"):
+                    raise ValueError(f"Evaluation record {record.record_id or count} has inconsistent research_role")
+                yield record
+            if count != int(evaluation_manifest.get("record_count", -1)):
+                raise ValueError(f"Evaluation set record_count mismatch for {manifest_uri}")
+
+    @staticmethod
+    def _is_trainable(record: NormalizedRecord) -> bool:
+        if record.split != "train":
+            return False
+        role = record.metadata.get("research_role")
+        eligible = record.metadata.get("training_eligible")
+        if role is not None and role != "training":
+            return False
+        return eligible is not False
 
     def iter_training_records(self) -> Iterator[NormalizedRecord]:
         for record in self.iter_records():
-            if record.split == "evaluation":
-                continue
-            yield record
+            if self._is_trainable(record):
+                yield record
 
     def iter_evaluation_records(self) -> Iterator[NormalizedRecord]:
         for record in self.iter_records():
-            if record.split == "evaluation":
+            if not self._is_trainable(record):
                 yield record
 
     def statistics(self) -> DatasetStatistics:
         total = training = evaluation = 0
-        split_summary: dict[str, int] = {}
+        evaluation_suite_counts: dict[str, int] = {}
         for record in self.iter_records():
             total += 1
-            split_summary[record.split] = split_summary.get(record.split, 0) + 1
-            if record.split == "evaluation":
-                evaluation += 1
-            else:
+            if self._is_trainable(record):
                 training += 1
+            else:
+                evaluation += 1
+                role = str(record.metadata.get("research_role") or "legacy_evaluation")
+                evaluation_suite_counts[role] = evaluation_suite_counts.get(role, 0) + 1
         return DatasetStatistics(
             total_records=total,
             training_records=training,
@@ -401,7 +552,8 @@ class DataForgeDatasetReader:
             maximum_observed_token_length=None,
             maximum_accepted_token_length=None,
             configured_max_sequence_length=None,
-            split_summary=split_summary,
+            split_summary={"train": training, "evaluation": evaluation},
+            evaluation_suite_counts=evaluation_suite_counts,
         )
 
 
@@ -512,7 +664,7 @@ def iter_selected_training_examples(
 ) -> Iterator[SelectedTrainingExample]:
     accepted = 0
     for record in reader.iter_records():
-        if record.split == "evaluation":
+        if not reader._is_trainable(record):
             continue
         encoded = encode_supervised_example(tokenizer, record.messages)
         if len(encoded["input_ids"]) > max_sequence_length:
@@ -595,10 +747,13 @@ def preflight_dataset(
     max_observed: int | None = None
     max_accepted: int | None = None
     skipped_samples: list[dict[str, Any]] = []
+    evaluation_suite_counts: dict[str, int] = {}
     for record in reader.iter_records():
         total += 1
-        if record.split == "evaluation":
+        if not reader._is_trainable(record):
             evaluation += 1
+            role = str(record.metadata.get("research_role") or "legacy_evaluation")
+            evaluation_suite_counts[role] = evaluation_suite_counts.get(role, 0) + 1
             continue
         training += 1
         tokenized = encode_supervised_example(tokenizer, record.messages)
@@ -630,7 +785,7 @@ def preflight_dataset(
         raise ValueError(
             f"Manifest train_count {manifest_train} disagrees with streamed training records {training}."
         )
-    if manifest_eval is not None and int(manifest_eval) != evaluation:
+    if manifest_eval is not None and reader._research_package is None and int(manifest_eval) != evaluation:
         raise ValueError(
             f"Manifest eval_count {manifest_eval} disagrees with streamed evaluation records {evaluation}."
         )
@@ -658,6 +813,7 @@ def preflight_dataset(
             maximum_accepted_token_length=max_accepted,
             configured_max_sequence_length=max_sequence_length,
             split_summary={"train": training, "evaluation": evaluation},
+            evaluation_suite_counts=evaluation_suite_counts,
             skipped_record_samples=tuple(skipped_samples),
             skipped_record_sample_limit=skipped_sample_limit,
             warnings=(),
