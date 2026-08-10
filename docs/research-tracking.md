@@ -13,7 +13,7 @@ DataForge research package
   -> fixed-budget training
   -> final predictions
   -> Storage publication
-  -> optional tracker index
+  -> optional live tracker index
 ```
 
 ## Input isolation
@@ -47,7 +47,26 @@ Reports contain overall metrics and separate `suite_metrics` for roles such as
 `legacy_validation` and `legacy_test`. Prediction rows retain the role and
 evaluation lineage for later forensic evaluation.
 
-## Optional MLflow index
+## Optional live run index
+
+Training already knows the current optimizer step, loss, processed examples and
+tokens, elapsed time, and the resource samples collected for its report. An
+optional tracker receives those measurements while the run is active. This
+means a later research tool can read a learning curve directly instead of
+trying to reconstruct one from terminal text.
+
+The tracker follows a small run lifecycle: start, record measurements, record
+named evaluation suites, attach Storage references, and finish or fail. The
+default implementation does nothing (a `NoOpTracker`), so tracking cannot
+become an accidental requirement.
+
+Measurements are emitted at the existing progress interval. Process and host
+measurements name their scope—for example, the Python process versus the whole
+WSL virtual machine. GPU utilization, memory, power, and accumulated energy are
+sent only when the resource sampler actually provides them. Baseline and final
+evaluation events retain the research role and frozen evaluation-set identity.
+
+## MLflow implementation
 
 No tracker is used by default:
 
@@ -69,11 +88,12 @@ parent_run_id = "optional-existing-parent-run-id"
 failure_policy = "warn"
 ```
 
-`warn` preserves a successfully published Training run if the tracker is
-temporarily unavailable; `error` makes tracking failure fail the command. The
-tracker logs IDs, result-changing parameters, scalar metrics, resource
-measurements, and Cognityx Storage URI/checksum references. It does not upload
-the adapter, report or prediction files again.
+`warn` keeps Training running if the tracker is temporarily unavailable;
+`error` makes tracking failure fail the command. The tracker logs IDs,
+result-changing parameters, live scalar metrics, named evaluation suites,
+resource measurements, and Cognityx Storage URI/checksum references. It does
+not upload the adapter, report, dataset, or prediction files again. Storage
+publication remains the authoritative result.
 
 ## Idempotent backfill
 
@@ -89,5 +109,8 @@ uv run --extra tracking cognityx-track-publication \
 The completed publication URI is the idempotency key. Repeating the backfill
 finds the existing external run instead of creating a duplicate. Only a
 `cognityx.training.publication/v1` manifest with `status=completed` is accepted.
+Backfill is marked as a later registration and stores the original Training
+start time, finish time, and duration as metadata. Its registration time is not
+presented as the time when training occurred.
 
 Training-to-Inference adapter loading and serving remain outside this release.

@@ -16,8 +16,11 @@ from cognityx_training.evaluation_pipeline import EvaluationPipeline
 from cognityx_training.tracking import (
     MLflowTracker,
     NoOpTracker,
+    RunTracker,
     TrackingResult,
+    TrackingSession,
     create_tracker,
+    create_tracking_session,
     payload_from_publication,
 )
 
@@ -28,11 +31,14 @@ __all__ = [
     "EvaluationPipeline",
     "MLflowTracker",
     "NoOpTracker",
+    "RunTracker",
     "TrackingResult",
+    "TrackingSession",
     "AutotuneConfig",
     "AdapterVerificationResult",
     "create_training_backend",
     "create_tracker",
+    "create_tracking_session",
     "ResourceMonitor",
     "TrainingLineageIds",
     "TrainingPublisher",

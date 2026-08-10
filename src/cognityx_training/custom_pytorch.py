@@ -41,7 +41,7 @@ from cognityx_training.reporting import (
 )
 from cognityx_training.telemetry import query_host, query_nvidia_gpus
 from cognityx_training.storage_runtime import resolve_storage_runtime
-from cognityx_training.tracking import completed_run_payload, track_configured_run
+from cognityx_training.tracking import TrackingSession, create_tracking_session
 
 
 _PERSISTENT_MODEL_CACHE: dict[tuple[Any, ...], tuple[Any, Any]] = {}
@@ -68,6 +68,91 @@ def evaluation_changes(
             trained["contains_expected_accuracy"] - baseline["contains_expected_accuracy"]
         ),
     }
+
+
+def _evaluation_tracking_events(
+    evaluation: dict[str, Any],
+    *,
+    phase: str,
+) -> list[tuple[dict[str, Any], dict[str, float]]]:
+    """Return scalar evaluation events with their research-suite identity."""
+    events: list[tuple[dict[str, Any], dict[str, float]]] = []
+    for role, values in sorted(evaluation.get("suite_metrics", {}).items()):
+        metrics = {
+            name: float(value)
+            for name, value in values.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+        events.append((
+            {
+                "phase": phase,
+                "research_role": role,
+                "evaluation_sets": list(values.get("evaluation_sets") or []),
+            },
+            metrics,
+        ))
+    return events
+
+
+def _live_tracking_metrics(
+    *,
+    step: int,
+    loss: float,
+    examples_processed: int,
+    input_tokens_processed: int,
+    target_tokens_processed: int,
+    elapsed_seconds: float,
+    resource_snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    """Build live metrics only from values already measured by Training."""
+    metrics: dict[str, Any] = {
+        "training.global_step": step,
+        "training.optimizer_step": step,
+        "training.loss": loss,
+        "training.examples_processed": examples_processed,
+        "training.input_tokens_processed": input_tokens_processed,
+        "training.target_tokens_processed": target_tokens_processed,
+        "training.elapsed_seconds": elapsed_seconds,
+    }
+    if elapsed_seconds > 0:
+        metrics.update({
+            "training.examples_per_second": examples_processed / elapsed_seconds,
+            "training.input_tokens_per_second": input_tokens_processed / elapsed_seconds,
+            "training.target_tokens_per_second": target_tokens_processed / elapsed_seconds,
+        })
+    metrics.update({
+        "resource.process.cpu_percent": resource_snapshot.get("cpu_percent"),
+        "resource.process.ram_bytes": resource_snapshot.get("ram_bytes"),
+        "resource.process.disk_read_bytes": resource_snapshot.get("disk_read_bytes"),
+        "resource.process.disk_write_bytes": resource_snapshot.get("disk_write_bytes"),
+    })
+    host = dict(resource_snapshot.get("host") or {})
+    if host:
+        scope = str(host.get("scope") or "unspecified").replace(".", "_")
+        prefix = f"resource.host.{scope}"
+        metrics.update({
+            f"{prefix}.cpu_percent": host.get("cpu_percent"),
+            f"{prefix}.ram_used_bytes": host.get("used_bytes"),
+            f"{prefix}.ram_used_percent": host.get("used_percent"),
+            f"{prefix}.ram_total_bytes": host.get("total_bytes"),
+        })
+    gpu = dict(resource_snapshot.get("gpu") or {})
+    if gpu:
+        scope = str(gpu.get("scope") or "unspecified").replace(".", "_")
+        index = gpu.get("device_index", 0)
+        prefix = f"resource.gpu.{scope}.device_{index}"
+        metrics.update({
+            f"{prefix}.utilization_percent": gpu.get("utilization_percent"),
+            f"{prefix}.memory_used_bytes": gpu.get("memory_used_bytes"),
+            f"{prefix}.memory_total_bytes": gpu.get("memory_total_bytes"),
+            f"{prefix}.framework_allocated_bytes": gpu.get("framework_allocated_bytes"),
+            f"{prefix}.framework_reserved_bytes": gpu.get("framework_reserved_bytes"),
+            f"{prefix}.power_draw_watts": gpu.get("power_draw_watts"),
+        })
+        gpu_aggregate = dict(resource_snapshot.get("gpu_aggregate") or {})
+        if gpu_aggregate.get("energy_joules") is not None:
+            metrics[f"{prefix}.accumulated_energy_joules"] = gpu_aggregate["energy_joules"]
+    return {key: value for key, value in metrics.items() if value is not None}
 
 
 class _StreamingTrainingDataset(_IterableDatasetBase):
@@ -180,6 +265,20 @@ def _evaluate_model(
             "exact_match_accuracy": sum(item["exact_match"] for item in rows) / suite_count,
             "contains_expected_accuracy": sum(item["contains_expected"] for item in rows) / suite_count,
             "record_ids": [item.get("record_id") for item in rows],
+            "evaluation_sets": [
+                {"evaluation_set_id": identity[0], "evaluation_set_version": identity[1]}
+                for identity in sorted(
+                    {
+                        (
+                            item.get("metadata", {}).get("evaluation_set_id"),
+                            item.get("metadata", {}).get("evaluation_set_version"),
+                        )
+                        for item in rows
+                        if item.get("metadata", {}).get("evaluation_set_id")
+                    },
+                    key=lambda value: (str(value[0]), str(value[1])),
+                )
+            ],
         }
     return {
         "example_count": count,
@@ -208,11 +307,13 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
         self.artifact_registry = artifact_registry
         self.storage_runtime = storage_runtime
         self._active_publisher: TrainingPublisher | None = None
+        self._tracking_session: TrackingSession | None = None
         self._publication_phase = "initialization"
 
     def train(self, request: TrainingRequest) -> TrainingResult:
         """Execute training and preserve an immutable failure record when possible."""
         self._active_publisher = None
+        self._tracking_session = None
         self._publication_phase = "initialization"
         try:
             return self._train(request)
@@ -222,6 +323,17 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
                     exc,
                     phase=self._publication_phase,
                 )
+            if self._tracking_session is not None:
+                try:
+                    self._tracking_session.fail(
+                        exc,
+                        {
+                            "phase": self._publication_phase,
+                            "failed_at": utc_now(),
+                        },
+                    )
+                except Exception as tracking_exc:
+                    exc.add_note(f"Tracking failure reporting also failed: {tracking_exc}")
             raise
 
     def _train(self, request: TrainingRequest) -> TrainingResult:
@@ -330,6 +442,24 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
                 base_model_identity=base_model_identity,
                 publication_mode=self.config.publication_mode,
             )
+        tracking_started_at = utc_now()
+        self._tracking_session = create_tracking_session(
+            backend=self.config.tracking_backend,
+            tracking_uri=self.config.tracking_uri,
+            experiment_name=self.config.tracking_experiment_name,
+            run_name=self.config.tracking_run_name,
+            parent_run_id=self.config.tracking_parent_run_id,
+            failure_policy=self.config.tracking_failure_policy,
+            context={
+                "identity": ids.to_dict(),
+                "parameters": variant_identity,
+                "metadata": {
+                    "registration_mode": "live",
+                    "tracking_started_at": tracking_started_at,
+                },
+                "idempotency_keys": [ids.training_run_id],
+            },
+        )
         self._publication_phase = "model-loading"
         torch.manual_seed(self.config.seed)
         if torch.cuda.is_available():
@@ -379,6 +509,15 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
             self.config.evaluation_max_new_tokens,
             torch,
         )
+        for suite_identity, suite_metrics in _evaluation_tracking_events(
+            baseline_evaluation,
+            phase="baseline",
+        ):
+            self._tracking_session.log_evaluation(
+                suite_identity,
+                suite_metrics,
+                step=0,
+            )
         model = get_peft_model(
             model,
             LoraConfig(
@@ -462,11 +601,13 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
         losses: list[float] = []
         step_times: list[float] = []
         completed_steps = 0
+        training_examples_processed = 0
         training_input_tokens_processed = 0
         training_target_tokens_processed = 0
         while completed_steps < self.config.max_steps:
             for batch in loader:
                 step_started = time.perf_counter()
+                training_examples_processed += int(batch["input_ids"].shape[0])
                 training_input_tokens_processed += int(batch["attention_mask"].sum().item())
                 training_target_tokens_processed += int((batch["labels"] != -100).sum().item())
                 outputs = model(
@@ -486,14 +627,27 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
                         or completed_steps % self.config.progress_interval_steps == 0
                         or completed_steps == self.config.max_steps
                     ):
+                        resource_snapshot = monitor.snapshot()
                         print(
                             format_progress(
                                 completed_steps,
                                 self.config.max_steps,
                                 losses[-1],
-                                monitor.snapshot(),
+                                resource_snapshot,
                             ),
                             flush=True,
+                        )
+                        self._tracking_session.log_metrics(
+                            _live_tracking_metrics(
+                                step=completed_steps,
+                                loss=losses[-1],
+                                examples_processed=training_examples_processed,
+                                input_tokens_processed=training_input_tokens_processed,
+                                target_tokens_processed=training_target_tokens_processed,
+                                elapsed_seconds=time.perf_counter() - started,
+                                resource_snapshot=resource_snapshot,
+                            ),
+                            step=completed_steps,
                         )
                     if completed_steps >= self.config.max_steps:
                         step_times.append(time.perf_counter() - step_started)
@@ -514,6 +668,15 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
             self.config.evaluation_max_new_tokens,
             torch,
         )
+        for suite_identity, suite_metrics in _evaluation_tracking_events(
+            trained_evaluation,
+            phase="trained",
+        ):
+            self._tracking_session.log_evaluation(
+                suite_identity,
+                suite_metrics,
+                step=completed_steps,
+            )
         self._publication_phase = "reporting"
         runtime_seconds = time.perf_counter() - started
         resources = monitor.stop()
@@ -523,6 +686,7 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
             "train_steps": completed_steps,
             "train_runtime_seconds": runtime_seconds,
             "training_examples": preflight.statistics.accepted_training_examples,
+            "training_examples_processed": training_examples_processed,
             "training_input_tokens_processed": training_input_tokens_processed,
             "training_target_tokens_processed": training_target_tokens_processed,
             "dataset_examples_available": preflight.statistics.total_records,
@@ -781,25 +945,29 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
                 "dataset_records": preflight.lineage.records_checksum,
                 "research_package_manifest": preflight.lineage.research_package_manifest_checksum,
             }
-        tracking_payload = completed_run_payload(
-            identity=ids.to_dict(),
-            parameters=variant_identity,
-            metrics=metrics,
-            resources={
-                "system_usage": report["system_usage"],
-                "gpu_usage": report["gpu_usage"],
+        self._tracking_session.log_metrics(
+            {
+                **metrics,
+                "resources": {
+                    "system_usage": report["system_usage"],
+                    "gpu_usage": report["gpu_usage"],
+                },
             },
-            artifact_references=tracking_references,
-            artifact_checksums=tracking_checksums,
+            step=completed_steps,
         )
-        tracking_result = track_configured_run(
-            tracking_payload,
-            backend=self.config.tracking_backend,
-            tracking_uri=self.config.tracking_uri,
-            experiment_name=self.config.tracking_experiment_name,
-            run_name=self.config.tracking_run_name,
-            parent_run_id=self.config.tracking_parent_run_id,
-            failure_policy=self.config.tracking_failure_policy,
+        self._tracking_session.log_artifact_references(
+            tracking_references,
+            tracking_checksums,
+        )
+        tracking_result = self._tracking_session.finish(
+            "completed",
+            {
+                "registration_mode": "live",
+                "training_started_at": started_at,
+                "training_finished_at": finished_at,
+                "training_duration_seconds": runtime_seconds,
+                "storage_publication_authoritative": True,
+            },
         )
         metrics.update({
             "tracking_backend": tracking_result.backend,
