@@ -50,6 +50,7 @@ class PublicationResult:
     baseline_predictions_uri: str
     trained_predictions_uri: str
     publication_manifest_uri: str
+    artifact_checksums: dict[str, str]
 
 
 def sha256_file(path: Path) -> str:
@@ -135,6 +136,14 @@ def canonical_variant_identity(
             "manifest_checksum": dataset_lineage.dataset_manifest_checksum,
             "records_checksum": dataset_lineage.records_checksum,
             "recipe": dataset_lineage.recipe,
+            "research_package_manifest_checksum": dataset_lineage.research_package_manifest_checksum,
+            "evaluation_sets": [
+                {
+                    "research_role": item.get("research_role"),
+                    "records_checksum": item.get("records_checksum"),
+                }
+                for item in dataset_lineage.evaluation_sets
+            ],
         },
         "base_model": dict(base_model_identity),
         "training": {
@@ -511,6 +520,7 @@ class TrainingPublisher:
             baseline_predictions_uri=baseline_uri,
             trained_predictions_uri=trained_uri,
             publication_manifest_uri=terminal_object.uri,
+            artifact_checksums=dict(artifact_checksums),
         )
 
     def _publish_predictions(
@@ -608,6 +618,12 @@ def prediction_rows(
                 "probe_id": combined.get("probe_id"),
                 "probe_class": combined.get("probe_class"),
                 "recipe": combined.get("recipe"),
+                "research_role": combined.get("research_role"),
+                "evaluation_set_id": combined.get("evaluation_set_id"),
+                "evaluation_set_version": combined.get("evaluation_set_version"),
+                "source_record_id": combined.get("source_record_id"),
+                "source_reference_id": combined.get("source_reference_id"),
+                "fact_group_id": combined.get("fact_group_id"),
                 "provenance": original_provenance,
                 "metadata": original_metadata,
                 "decoding": dict(decoding),

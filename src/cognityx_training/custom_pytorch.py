@@ -41,6 +41,7 @@ from cognityx_training.reporting import (
 )
 from cognityx_training.telemetry import query_host, query_nvidia_gpus
 from cognityx_training.storage_runtime import resolve_storage_runtime
+from cognityx_training.tracking import TrackingSession, create_tracking_session
 
 
 _PERSISTENT_MODEL_CACHE: dict[tuple[Any, ...], tuple[Any, Any]] = {}
@@ -67,6 +68,91 @@ def evaluation_changes(
             trained["contains_expected_accuracy"] - baseline["contains_expected_accuracy"]
         ),
     }
+
+
+def _evaluation_tracking_events(
+    evaluation: dict[str, Any],
+    *,
+    phase: str,
+) -> list[tuple[dict[str, Any], dict[str, float]]]:
+    """Return scalar evaluation events with their research-suite identity."""
+    events: list[tuple[dict[str, Any], dict[str, float]]] = []
+    for role, values in sorted(evaluation.get("suite_metrics", {}).items()):
+        metrics = {
+            name: float(value)
+            for name, value in values.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+        events.append((
+            {
+                "phase": phase,
+                "research_role": role,
+                "evaluation_sets": list(values.get("evaluation_sets") or []),
+            },
+            metrics,
+        ))
+    return events
+
+
+def _live_tracking_metrics(
+    *,
+    step: int,
+    loss: float,
+    examples_processed: int,
+    input_tokens_processed: int,
+    target_tokens_processed: int,
+    elapsed_seconds: float,
+    resource_snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    """Build live metrics only from values already measured by Training."""
+    metrics: dict[str, Any] = {
+        "training.global_step": step,
+        "training.optimizer_step": step,
+        "training.loss": loss,
+        "training.examples_processed": examples_processed,
+        "training.input_tokens_processed": input_tokens_processed,
+        "training.target_tokens_processed": target_tokens_processed,
+        "training.elapsed_seconds": elapsed_seconds,
+    }
+    if elapsed_seconds > 0:
+        metrics.update({
+            "training.examples_per_second": examples_processed / elapsed_seconds,
+            "training.input_tokens_per_second": input_tokens_processed / elapsed_seconds,
+            "training.target_tokens_per_second": target_tokens_processed / elapsed_seconds,
+        })
+    metrics.update({
+        "resource.process.cpu_percent": resource_snapshot.get("cpu_percent"),
+        "resource.process.ram_bytes": resource_snapshot.get("ram_bytes"),
+        "resource.process.disk_read_bytes": resource_snapshot.get("disk_read_bytes"),
+        "resource.process.disk_write_bytes": resource_snapshot.get("disk_write_bytes"),
+    })
+    host = dict(resource_snapshot.get("host") or {})
+    if host:
+        scope = str(host.get("scope") or "unspecified").replace(".", "_")
+        prefix = f"resource.host.{scope}"
+        metrics.update({
+            f"{prefix}.cpu_percent": host.get("cpu_percent"),
+            f"{prefix}.ram_used_bytes": host.get("used_bytes"),
+            f"{prefix}.ram_used_percent": host.get("used_percent"),
+            f"{prefix}.ram_total_bytes": host.get("total_bytes"),
+        })
+    gpu = dict(resource_snapshot.get("gpu") or {})
+    if gpu:
+        scope = str(gpu.get("scope") or "unspecified").replace(".", "_")
+        index = gpu.get("device_index", 0)
+        prefix = f"resource.gpu.{scope}.device_{index}"
+        metrics.update({
+            f"{prefix}.utilization_percent": gpu.get("utilization_percent"),
+            f"{prefix}.memory_used_bytes": gpu.get("memory_used_bytes"),
+            f"{prefix}.memory_total_bytes": gpu.get("memory_total_bytes"),
+            f"{prefix}.framework_allocated_bytes": gpu.get("framework_allocated_bytes"),
+            f"{prefix}.framework_reserved_bytes": gpu.get("framework_reserved_bytes"),
+            f"{prefix}.power_draw_watts": gpu.get("power_draw_watts"),
+        })
+        gpu_aggregate = dict(resource_snapshot.get("gpu_aggregate") or {})
+        if gpu_aggregate.get("energy_joules") is not None:
+            metrics[f"{prefix}.accumulated_energy_joules"] = gpu_aggregate["energy_joules"]
+    return {key: value for key, value in metrics.items() if value is not None}
 
 
 class _StreamingTrainingDataset(_IterableDatasetBase):
@@ -118,20 +204,30 @@ def _evaluate_model(
             messages = record.messages if hasattr(record, "messages") else record["messages"]
             prompt = next(item["content"] for item in reversed(messages) if item["role"] == "user")
             expected = next(item["content"] for item in reversed(messages) if item["role"] == "assistant")
-            input_ids = tokenizer.apply_chat_template(
+            inputs = tokenizer.apply_chat_template(
                 [{"role": "user", "content": prompt}],
                 tokenize=True,
                 add_generation_prompt=True,
                 return_tensors="pt",
-            ).to(input_device)
+                return_dict=True,
+            )
+            if not hasattr(inputs, "items"):
+                raise TypeError("Evaluation chat template must return a BatchEncoding-like mapping")
+            inputs = {
+                key: value.to(input_device) if hasattr(value, "to") else value
+                for key, value in inputs.items()
+            }
+            if "input_ids" not in inputs:
+                raise ValueError("Evaluation chat template did not return input_ids")
+            input_length = inputs["input_ids"].shape[-1]
             output_ids = model.generate(
-                input_ids=input_ids,
+                **inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
             )
             generated = tokenizer.decode(
-                output_ids[0, input_ids.shape[-1] :], skip_special_tokens=True
+                output_ids[0, input_length:], skip_special_tokens=True
             ).strip()
             normalized_expected = " ".join(expected.lower().split())
             normalized_generated = " ".join(generated.lower().split())
@@ -157,6 +253,33 @@ def _evaluate_model(
     if was_training:
         model.train()
     count = len(results)
+    suites: dict[str, dict[str, Any]] = {}
+    suite_rows: dict[str, list[dict[str, Any]]] = {}
+    for row in results:
+        role = str(row.get("metadata", {}).get("research_role") or "legacy_evaluation")
+        suite_rows.setdefault(role, []).append(row)
+    for role, rows in sorted(suite_rows.items()):
+        suite_count = len(rows)
+        suites[role] = {
+            "example_count": suite_count,
+            "exact_match_accuracy": sum(item["exact_match"] for item in rows) / suite_count,
+            "contains_expected_accuracy": sum(item["contains_expected"] for item in rows) / suite_count,
+            "record_ids": [item.get("record_id") for item in rows],
+            "evaluation_sets": [
+                {"evaluation_set_id": identity[0], "evaluation_set_version": identity[1]}
+                for identity in sorted(
+                    {
+                        (
+                            item.get("metadata", {}).get("evaluation_set_id"),
+                            item.get("metadata", {}).get("evaluation_set_version"),
+                        )
+                        for item in rows
+                        if item.get("metadata", {}).get("evaluation_set_id")
+                    },
+                    key=lambda value: (str(value[0]), str(value[1])),
+                )
+            ],
+        }
     return {
         "example_count": count,
         "exact_match_accuracy": (
@@ -165,6 +288,7 @@ def _evaluate_model(
         "contains_expected_accuracy": (
             sum(item["contains_expected"] for item in results) / count if count else None
         ),
+        "suite_metrics": suites,
         "outputs": results,
     }
 
@@ -183,11 +307,13 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
         self.artifact_registry = artifact_registry
         self.storage_runtime = storage_runtime
         self._active_publisher: TrainingPublisher | None = None
+        self._tracking_session: TrackingSession | None = None
         self._publication_phase = "initialization"
 
     def train(self, request: TrainingRequest) -> TrainingResult:
         """Execute training and preserve an immutable failure record when possible."""
         self._active_publisher = None
+        self._tracking_session = None
         self._publication_phase = "initialization"
         try:
             return self._train(request)
@@ -197,6 +323,17 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
                     exc,
                     phase=self._publication_phase,
                 )
+            if self._tracking_session is not None:
+                try:
+                    self._tracking_session.fail(
+                        exc,
+                        {
+                            "phase": self._publication_phase,
+                            "failed_at": utc_now(),
+                        },
+                    )
+                except Exception as tracking_exc:
+                    exc.add_note(f"Tracking failure reporting also failed: {tracking_exc}")
             raise
 
     def _train(self, request: TrainingRequest) -> TrainingResult:
@@ -305,6 +442,24 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
                 base_model_identity=base_model_identity,
                 publication_mode=self.config.publication_mode,
             )
+        tracking_started_at = utc_now()
+        self._tracking_session = create_tracking_session(
+            backend=self.config.tracking_backend,
+            tracking_uri=self.config.tracking_uri,
+            experiment_name=self.config.tracking_experiment_name,
+            run_name=self.config.tracking_run_name,
+            parent_run_id=self.config.tracking_parent_run_id,
+            failure_policy=self.config.tracking_failure_policy,
+            context={
+                "identity": ids.to_dict(),
+                "parameters": variant_identity,
+                "metadata": {
+                    "registration_mode": "live",
+                    "tracking_started_at": tracking_started_at,
+                },
+                "idempotency_keys": [ids.training_run_id],
+            },
+        )
         self._publication_phase = "model-loading"
         torch.manual_seed(self.config.seed)
         if torch.cuda.is_available():
@@ -354,6 +509,15 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
             self.config.evaluation_max_new_tokens,
             torch,
         )
+        for suite_identity, suite_metrics in _evaluation_tracking_events(
+            baseline_evaluation,
+            phase="baseline",
+        ):
+            self._tracking_session.log_evaluation(
+                suite_identity,
+                suite_metrics,
+                step=0,
+            )
         model = get_peft_model(
             model,
             LoraConfig(
@@ -437,9 +601,15 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
         losses: list[float] = []
         step_times: list[float] = []
         completed_steps = 0
+        training_examples_processed = 0
+        training_input_tokens_processed = 0
+        training_target_tokens_processed = 0
         while completed_steps < self.config.max_steps:
             for batch in loader:
                 step_started = time.perf_counter()
+                training_examples_processed += int(batch["input_ids"].shape[0])
+                training_input_tokens_processed += int(batch["attention_mask"].sum().item())
+                training_target_tokens_processed += int((batch["labels"] != -100).sum().item())
                 outputs = model(
                     input_ids=batch["input_ids"].to(input_device),
                     attention_mask=batch["attention_mask"].to(input_device),
@@ -457,14 +627,27 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
                         or completed_steps % self.config.progress_interval_steps == 0
                         or completed_steps == self.config.max_steps
                     ):
+                        resource_snapshot = monitor.snapshot()
                         print(
                             format_progress(
                                 completed_steps,
                                 self.config.max_steps,
                                 losses[-1],
-                                monitor.snapshot(),
+                                resource_snapshot,
                             ),
                             flush=True,
+                        )
+                        self._tracking_session.log_metrics(
+                            _live_tracking_metrics(
+                                step=completed_steps,
+                                loss=losses[-1],
+                                examples_processed=training_examples_processed,
+                                input_tokens_processed=training_input_tokens_processed,
+                                target_tokens_processed=training_target_tokens_processed,
+                                elapsed_seconds=time.perf_counter() - started,
+                                resource_snapshot=resource_snapshot,
+                            ),
+                            step=completed_steps,
                         )
                     if completed_steps >= self.config.max_steps:
                         step_times.append(time.perf_counter() - step_started)
@@ -485,6 +668,15 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
             self.config.evaluation_max_new_tokens,
             torch,
         )
+        for suite_identity, suite_metrics in _evaluation_tracking_events(
+            trained_evaluation,
+            phase="trained",
+        ):
+            self._tracking_session.log_evaluation(
+                suite_identity,
+                suite_metrics,
+                step=completed_steps,
+            )
         self._publication_phase = "reporting"
         runtime_seconds = time.perf_counter() - started
         resources = monitor.stop()
@@ -494,9 +686,13 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
             "train_steps": completed_steps,
             "train_runtime_seconds": runtime_seconds,
             "training_examples": preflight.statistics.accepted_training_examples,
+            "training_examples_processed": training_examples_processed,
+            "training_input_tokens_processed": training_input_tokens_processed,
+            "training_target_tokens_processed": training_target_tokens_processed,
             "dataset_examples_available": preflight.statistics.total_records,
             "dataset_examples_selected": preflight.statistics.selected_training_candidates,
             "evaluation_examples": preflight.statistics.evaluation_records,
+            "evaluation_suite_counts": dict(preflight.statistics.evaluation_suite_counts),
             "micro_batch_size": self.config.per_device_train_batch_size,
             "gradient_accumulation_steps": self.config.gradient_accumulation_steps,
             "effective_batch_size": (
@@ -569,7 +765,21 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
                     "source_manifest_checksum": preflight.lineage.source_manifest_checksum,
                     "configuration_checksum": preflight.lineage.configuration_checksum,
                     "split_summary": preflight.statistics.split_summary,
-                    "record_counts": preflight.lineage.record_counts,
+                    "record_counts": {
+                        "total": preflight.statistics.total_records,
+                        "training": preflight.statistics.training_records,
+                        "evaluation": preflight.statistics.evaluation_records,
+                        "selected_training_candidates": preflight.statistics.selected_training_candidates,
+                        "accepted_training_examples": preflight.statistics.accepted_training_examples,
+                        "skipped_overlength": preflight.statistics.skipped_overlength_count,
+                    },
+                    "evaluation_suite_counts": dict(preflight.statistics.evaluation_suite_counts),
+                    "manifest_record_counts": preflight.lineage.record_counts,
+                    "research_package_manifest_uri": preflight.lineage.research_package_manifest_uri,
+                    "research_package_manifest_checksum": preflight.lineage.research_package_manifest_checksum,
+                    "research_package_id": preflight.lineage.research_package_id,
+                    "research_package_version": preflight.lineage.research_package_version,
+                    "evaluation_sets": list(preflight.lineage.evaluation_sets),
                     "overlength_policy": preflight.lineage.overlength_policy,
                     "skipped_records": list(
                         preflight.statistics.skipped_record_samples
@@ -650,6 +860,8 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
             )
         report["base_model_reuse"] = cleanup
         metrics.update(ids.to_dict())
+        tracking_references: dict[str, Any]
+        tracking_checksums: dict[str, Any]
         if publisher is not None:
             self._publication_phase = "storage-publication"
             decoding = {
@@ -708,10 +920,60 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
                 }
             )
             report_uri = publication.training_report_uri
+            tracking_references = {
+                "publication_manifest_uri": publication.publication_manifest_uri,
+                "adapter_uri": publication.adapter_uri,
+                "adapter_manifest_uri": publication.adapter_manifest_uri,
+                "training_report_uri": publication.training_report_uri,
+                "baseline_predictions_uri": publication.baseline_predictions_uri,
+                "trained_predictions_uri": publication.trained_predictions_uri,
+                "dataset_manifest_uri": preflight.lineage.dataset_manifest_uri,
+                "research_package_manifest_uri": preflight.lineage.research_package_manifest_uri,
+            }
+            tracking_checksums = dict(publication.artifact_checksums)
         else:
             report_path = write_training_report(report, output_dir)
             report_uri = report_path.resolve().as_uri()
             metrics["report_uri"] = report_uri
+            tracking_references = {
+                "training_report_uri": report_uri,
+                "adapter_uri": artifact.uri,
+                "dataset_manifest_uri": preflight.lineage.dataset_manifest_uri,
+                "research_package_manifest_uri": preflight.lineage.research_package_manifest_uri,
+            }
+            tracking_checksums = {
+                "dataset_records": preflight.lineage.records_checksum,
+                "research_package_manifest": preflight.lineage.research_package_manifest_checksum,
+            }
+        self._tracking_session.log_metrics(
+            {
+                **metrics,
+                "resources": {
+                    "system_usage": report["system_usage"],
+                    "gpu_usage": report["gpu_usage"],
+                },
+            },
+            step=completed_steps,
+        )
+        self._tracking_session.log_artifact_references(
+            tracking_references,
+            tracking_checksums,
+        )
+        tracking_result = self._tracking_session.finish(
+            "completed",
+            {
+                "registration_mode": "live",
+                "training_started_at": started_at,
+                "training_finished_at": finished_at,
+                "training_duration_seconds": runtime_seconds,
+                "storage_publication_authoritative": True,
+            },
+        )
+        metrics.update({
+            "tracking_backend": tracking_result.backend,
+            "tracking_status": tracking_result.status,
+            "tracking_external_run_id": tracking_result.external_run_id,
+        })
         try:
             return TrainingResult(
                 artifact=artifact,

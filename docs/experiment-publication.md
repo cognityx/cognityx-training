@@ -119,6 +119,8 @@ requiring a native backend path, or allocating a GPU.
 
 Baseline and trained outputs are streamed to separate JSONL artifacts with
 record, normalized DataForge evidence, decoding, model, and run lineage. The
+rows also retain the evaluation role, evaluation-set identity, fact group and
+source-record identity. Metrics are reported separately for each role. The
 evaluation workflow can judge those saved outputs after the training model is
 unloaded. A later Inference workflow can consume the verified adapter manifest.
 Training publication does not promote, deploy, serve, or release the adapter.

@@ -7,6 +7,7 @@
 ```text
 Ingest manifest
   → DataForge dataset manifest in Storage
+  → optional DataForge research package with frozen evaluation sets
   → cognityx-training preflight
   → streaming supervised fine-tuning
 ```
@@ -33,6 +34,10 @@ version = "1"
 uri = "storage://local-main/datasets/example/1/manifest.json"
 ```
 
+The same `uri` can point to a
+`cognityx.dataforge.research-package/v1` manifest. Training verifies the linked
+dataset and every evaluation-set checksum before model allocation.
+
 `--storage-config`, `--storage-root`, and `--dataset-input-mode` override TOML values when supplied on the CLI.
 
 ## Behavior
@@ -42,6 +47,16 @@ uri = "storage://local-main/datasets/example/1/manifest.json"
 - Loss is masked to assistant tokens only.
 - Oversized records fail by default, or can be skipped explicitly.
 - Training reports include a `dataset.lineage` section so runs remain traceable to the manifest and records artifact.
+- Only `split=train` records with `research_role=training` and no explicit
+  `training_eligible=false` reach the optimizer.
+- Historical `validation` and `test` records remain readable as evaluation
+  records. Their original split is preserved as `original_split`.
+- Frozen evaluation records use `split=evaluation`, an explicit role such as
+  `exact_recall` or `paraphrase_evaluation`, and
+  `training_eligible=false`.
+- Reports distinguish optimizer counts, total evaluation counts and counts for
+  each evaluation role. A known zero is written as `0`; an absent source field
+  remains absent rather than being guessed.
 
 ## Commands
 

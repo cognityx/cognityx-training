@@ -134,12 +134,15 @@ class ResourceMonitor:
         if not self._samples:
             self._sample()
         latest = self._samples[-1]
+        gpu_samples = [sample["gpu"] for sample in self._samples if sample["gpu"]]
+        gpu_aggregate = self._aggregate_gpu(gpu_samples)
         current_io = self._safe_io()
         snapshot = {
             "cpu_percent": latest["cpu_percent"],
             "ram_bytes": latest["ram_bytes"],
             "host": latest["host"],
             "gpu": latest["gpu"],
+            "gpu_aggregate": gpu_aggregate[0] if gpu_aggregate else None,
             "disk_read_bytes": 0,
             "disk_write_bytes": 0,
         }

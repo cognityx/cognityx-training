@@ -10,6 +10,7 @@ nav:
   - Qwen hello world: qwen-hello-world.md
   - DataForge datasets: dataforge-training.md
   - Experiment publication: experiment-publication.md
+  - Research packages and tracking: research-tracking.md
   - Sequential candidate evaluation: candidate-evaluation.md
   - Capacity and benefit validation: two-phase-validation.md
   - Automatic capacity tuning: autotune.md

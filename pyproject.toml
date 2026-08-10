@@ -25,11 +25,15 @@ training = [
 evaluation = [
     "cognityx-inference; python_version >= '3.12'",
 ]
+tracking = [
+    "mlflow>=2.20",
+]
 
 [project.scripts]
 cognityx-train = "cognityx_training.cli:main"
 cognityx-autotune = "cognityx_training.autotune:main"
 cognityx-evaluate = "cognityx_training.evaluation_cli:main"
+cognityx-track-publication = "cognityx_training.tracking_cli:main"
 
 [dependency-groups]
 dev = [
