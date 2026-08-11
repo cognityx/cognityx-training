@@ -143,6 +143,22 @@ supplying one frozen run's changing references on the command line:
 Experiments pass the authoritative DataForge package and deterministic run
 identity without rewriting model or optimizer logic.
 
+For a program calling Training, `--output-format json` makes standard output a
+single machine-readable result (`cognityx.training.cli-result/v1`). A dry run
+returns safe record counts and dataset checksums with `mode: dry_run`. A
+completed run returns only its IDs and authoritative Storage references with
+`mode: completed`; it does not copy the adapter manifest into the response.
+Progress and status remain visible on standard error. Human output remains the
+default for a person running the command. `--print-config` is rejected with JSON
+mode so the machine channel can never contain two documents.
+
+If a caller loses the completed JSON response after Storage publication, it can
+retry with the same Training run ID. Training verifies the matching terminal
+publication and adapter bundle, then returns the existing handoff before model
+weights are allocated. This closes the small crash window between component
+success and an orchestrator recording that success without creating a second
+adapter.
+
 The base-model identity names the tokenizer source actually passed to
 Transformers, together with its resolved revision and chat-template checksum.
 This makes the text-to-token rules visible without inventing a separate

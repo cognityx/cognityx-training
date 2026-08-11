@@ -8,8 +8,9 @@ import gc
 import os
 from pathlib import Path
 import subprocess
+import sys
 import time
-from typing import Any
+from typing import Any, Mapping
 
 from cognityx_core import Artifact, ModelArtifactRegistry, TrainingBackend
 from cognityx_core.models import TrainingRequest, TrainingResult
@@ -24,6 +25,7 @@ from cognityx_training.dataset_pipeline import (
 )
 from cognityx_training.lineage import build_lineage_ids
 from cognityx_training.publication import (
+    PublicationResult,
     TrainingPublisher,
     canonical_variant_identity,
     prediction_rows,
@@ -51,6 +53,11 @@ except ImportError:  # pragma: no cover - imported lazily in normal training pat
     torch = None
 
 _IterableDatasetBase = torch.utils.data.IterableDataset if torch is not None else object
+
+
+def _status(message: str) -> None:
+    """Keep Training progress visible without using the machine-result channel."""
+    print(message, file=sys.stderr, flush=True)
 
 
 def evaluation_changes(
@@ -293,6 +300,41 @@ def _evaluate_model(
     }
 
 
+def _reused_training_result(
+    request: TrainingRequest,
+    ids: Mapping[str, str],
+    publication: PublicationResult,
+) -> TrainingResult:
+    """Rebuild the public handoff from an authoritative terminal publication."""
+    artifact = Artifact(
+        name=f"{request.dataset.name}-qwen-adapter",
+        version="1",
+        uri=publication.adapter_uri,
+        metadata={
+            **dict(ids),
+            "adapter_manifest_uri": publication.adapter_manifest_uri,
+            "publication_manifest_uri": publication.publication_manifest_uri,
+        },
+    )
+    metrics = {
+        **dict(ids),
+        "adapter_manifest_uri": publication.adapter_manifest_uri,
+        "report_uri": publication.training_report_uri,
+        "baseline_predictions_uri": publication.baseline_predictions_uri,
+        "trained_predictions_uri": publication.trained_predictions_uri,
+        "publication_manifest_uri": publication.publication_manifest_uri,
+        "reused_completed_publication": True,
+    }
+    try:
+        return TrainingResult(
+            artifact=artifact,
+            metrics=metrics,
+            report_uri=publication.training_report_uri,
+        )  # type: ignore[call-arg] - older Core lacks the additive field
+    except TypeError:
+        return TrainingResult(artifact=artifact, metrics=metrics)
+
+
 class CustomPyTorchTrainerBackend(TrainingBackend):
     """Run a minimal supervised fine-tuning job using Transformers and PEFT."""
 
@@ -342,6 +384,36 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
         Heavy training libraries are imported lazily so configuration, factories,
         and dataset validation remain usable without the ``training`` extra.
         """
+        storage_runtime = resolve_storage_runtime(
+            storage_runtime=self.storage_runtime,
+            storage_config=self.config.storage_config,
+            storage_root=self.config.storage_root,
+        )
+        requested_run_id = self.config.training_run_id or self.config.run_id
+        if (
+            self.config.publication_mode == "storage"
+            and self.config.experiment_id is not None
+            and requested_run_id is not None
+        ):
+            existing = TrainingPublisher.find_completed_run(
+                storage_runtime,
+                requested_experiment_id=self.config.experiment_id,
+                requested_training_run_id=requested_run_id,
+                experiment_name=self.config.experiment_name,
+                experiment_description=self.config.experiment_description,
+                experiment_created_by=self.config.experiment_created_by,
+                experiment_tags=self.config.experiment_tags,
+            )
+            if existing is not None:
+                completed_publisher, publication = existing
+                self._active_publisher = completed_publisher
+                self._publication_phase = "publication-reuse"
+                return _reused_training_result(
+                    request,
+                    completed_publisher.ids.to_dict(),
+                    publication,
+                )
+
         try:
             import torch
             from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
@@ -356,11 +428,6 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
                 "Training dependencies are missing. Run `uv sync --extra training`."
             ) from exc
 
-        storage_runtime = resolve_storage_runtime(
-            storage_runtime=self.storage_runtime,
-            storage_config=self.config.storage_config,
-            storage_root=self.config.storage_root,
-        )
         reader = DataForgeDatasetReader(
             request.dataset.uri,
             storage_runtime=storage_runtime,
@@ -496,10 +563,10 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
                     model,
                     gradient_checkpointing_kwargs={"use_reentrant": False},
                 )
-            print("COGNITYX_MODEL_LOADED fresh", flush=True)
+            _status("COGNITYX_MODEL_LOADED fresh")
         else:
             model, tokenizer = cached
-            print("COGNITYX_MODEL_LOADED reused", flush=True)
+            _status("COGNITYX_MODEL_LOADED reused")
         original_parameters = parameter_counts(model)
         input_device = model.get_input_embeddings().weight.device
         baseline_evaluation = _evaluate_model(
@@ -594,7 +661,7 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
             ),
             interval_seconds=self.config.resource_sample_interval_seconds,
         )
-        print("COGNITYX_TRAINING_STARTED", flush=True)
+        _status("COGNITYX_TRAINING_STARTED")
         self._publication_phase = "training"
         monitor.start()
         started_at = utc_now()
@@ -629,15 +696,12 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
                         or completed_steps == self.config.max_steps
                     ):
                         resource_snapshot = monitor.snapshot()
-                        print(
-                            format_progress(
-                                completed_steps,
-                                self.config.max_steps,
-                                losses[-1],
-                                resource_snapshot,
-                            ),
-                            flush=True,
-                        )
+                        _status(format_progress(
+                            completed_steps,
+                            self.config.max_steps,
+                            losses[-1],
+                            resource_snapshot,
+                        ))
                         self._tracking_session.log_metrics(
                             _live_tracking_metrics(
                                 step=completed_steps,
@@ -654,10 +718,7 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
                         step_times.append(time.perf_counter() - step_started)
                         break
                 step_times.append(time.perf_counter() - step_started)
-        print(
-            "COGNITYX_TRAINING_COMPLETED (optimizer); saving adapter and evaluating...",
-            flush=True,
-        )
+        _status("COGNITYX_TRAINING_COMPLETED (optimizer); saving adapter and evaluating...")
         self._publication_phase = "adapter-staging"
         model.save_pretrained(str(output_dir))
         tokenizer.save_pretrained(str(output_dir))
