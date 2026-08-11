@@ -6,7 +6,11 @@ from pathlib import Path
 import pytest
 from cognityx_storage import StorageConfig, StorageRuntime
 
-from cognityx_training.dataset_pipeline import DataForgeDatasetReader, dataforge_checksum
+from cognityx_training.dataset_pipeline import (
+    DataForgeDatasetReader,
+    dataforge_checksum,
+    dataforge_manifest_checksum,
+)
 
 
 def _jsonl(rows: list[dict]) -> bytes:
@@ -71,12 +75,19 @@ def _package(tmp_path: Path, *, trainable_evaluation: bool = False) -> tuple[Sto
             "record_count": len(rows),
             "records_uri": records_uri,
             "records_checksum": dataforge_checksum(raw.decode()),
+            "freeze_checksum": f"freeze-{role}",
         }
+        manifest["manifest_checksum"] = dataforge_manifest_checksum(manifest)
         uri = store.put_json(f"research/{role}/manifest.json", manifest).uri
         evaluation_refs.append({
             "manifest_uri": uri,
+            "evaluation_set_id": manifest["evaluation_set_id"],
+            "evaluation_set_version": manifest["evaluation_set_version"],
             "research_role": role,
             "records_checksum": manifest["records_checksum"],
+            "record_count": manifest["record_count"],
+            "freeze_checksum": manifest["freeze_checksum"],
+            "manifest_checksum": manifest["manifest_checksum"],
         })
     package = {
         "schema": "cognityx.dataforge.research-package/v1",
@@ -88,6 +99,7 @@ def _package(tmp_path: Path, *, trainable_evaluation: bool = False) -> tuple[Sto
         },
         "evaluation_sets": evaluation_refs,
     }
+    package["manifest_checksum"] = dataforge_manifest_checksum(package)
     return runtime, store.put_json("research/package/manifest.json", package).uri
 
 
@@ -110,9 +122,17 @@ def test_research_package_optimizer_and_evaluation_roles_are_disjoint(tmp_path: 
     lineage = reader.lineage()
     assert lineage.research_package_manifest_uri == package_uri
     assert lineage.research_package_id == "package-1"
+    assert lineage.research_package_version == "version-1"
+    assert lineage.research_package_manifest_checksum
     assert {item["research_role"] for item in lineage.evaluation_sets} == {
         "exact_recall", "paraphrase_evaluation",
     }
+    assert all(item["evaluation_set_id"] for item in lineage.evaluation_sets)
+    assert all(item["evaluation_set_version"] for item in lineage.evaluation_sets)
+    assert all(item["manifest_uri"] for item in lineage.evaluation_sets)
+    assert all(item["manifest_checksum"] for item in lineage.evaluation_sets)
+    assert all(item["records_checksum"] for item in lineage.evaluation_sets)
+    assert all(item["freeze_checksum"] for item in lineage.evaluation_sets)
     assert lineage.record_counts["candidates"] == 0
     assert "rejected" not in lineage.record_counts
 
@@ -132,3 +152,21 @@ def test_research_package_rejects_trainable_evaluation_record(tmp_path: Path):
     reader = DataForgeDatasetReader(package_uri, storage_runtime=runtime, input_mode="dataforge_manifest")
     with pytest.raises(ValueError, match="is trainable"):
         list(reader.iter_records())
+
+
+def test_research_package_rejects_changed_manifest(tmp_path: Path):
+    runtime, package_uri = _package(tmp_path)
+    store = runtime.for_role("dataset")
+    key = package_uri.removeprefix("storage://local-main/datasets/")
+    with store.open(key) as source:
+        package = json.load(source)
+    package["research_package_version"] = "tampered"
+    store.native_path(key).write_text(json.dumps(package), encoding="utf-8")
+
+    reader = DataForgeDatasetReader(
+        package_uri,
+        storage_runtime=runtime,
+        input_mode="dataforge_manifest",
+    )
+    with pytest.raises(ValueError, match="manifest checksum verification failed"):
+        reader.manifest()

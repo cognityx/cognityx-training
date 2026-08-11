@@ -52,11 +52,37 @@ def _lineage() -> DatasetLineage:
     )
 
 
+def _research_lineage() -> DatasetLineage:
+    return replace(
+        _lineage(),
+        research_package_manifest_uri=(
+            "storage://local-main/datasets/dataforge/research-packages/pkg/4/manifest.json"
+        ),
+        research_package_manifest_checksum="package-manifest-sha",
+        research_package_id="pkg",
+        research_package_version="4",
+        evaluation_sets=(
+            {
+                "research_role": "exact_recall",
+                "evaluation_set_id": "eval-exact",
+                "evaluation_set_version": "1",
+                "manifest_uri": "storage://local-main/datasets/evaluations/exact/1/manifest.json",
+                "manifest_checksum": "exact-manifest-sha",
+                "records_uri": "storage://local-main/datasets/evaluations/exact/1/records.jsonl",
+                "records_checksum": "exact-records-sha",
+                "record_count": 2,
+                "freeze_checksum": "exact-freeze-sha",
+            },
+        ),
+    )
+
+
 def _base_model() -> dict[str, str | None]:
     return {
         "name": "Qwen/Qwen3-8B",
         "requested_revision": "main",
         "resolved_revision": "commit-1",
+        "tokenizer_name": "Qwen/Qwen3-8B",
         "tokenizer_revision": "commit-1",
         "chat_template_checksum": "template-sha",
     }
@@ -72,10 +98,14 @@ def _config(tmp_path: Path, **changes) -> CustomPyTorchTrainingConfig:
     return replace(config, **changes)
 
 
-def _ids(tmp_path: Path) -> tuple[TrainingLineageIds, dict]:
+def _ids(
+    tmp_path: Path,
+    *,
+    lineage: DatasetLineage | None = None,
+) -> tuple[TrainingLineageIds, dict]:
     identity = canonical_variant_identity(
         _config(tmp_path),
-        _lineage(),
+        lineage or _lineage(),
         base_model_identity=_base_model(),
     )
     return (
@@ -100,8 +130,13 @@ def _adapter_staging(tmp_path: Path, name: str = "staging") -> Path:
     return staging
 
 
-def _publisher(tmp_path: Path, *, name: str = "Demo") -> tuple[TrainingPublisher, dict]:
-    ids, identity = _ids(tmp_path)
+def _publisher(
+    tmp_path: Path,
+    *,
+    name: str = "Demo",
+    lineage: DatasetLineage | None = None,
+) -> tuple[TrainingPublisher, dict]:
+    ids, identity = _ids(tmp_path, lineage=lineage)
     return (
         TrainingPublisher(
             _runtime(tmp_path / "storage"),
@@ -113,15 +148,21 @@ def _publisher(tmp_path: Path, *, name: str = "Demo") -> tuple[TrainingPublisher
     )
 
 
-def _prepare(publisher: TrainingPublisher, identity: dict) -> None:
+def _prepare(
+    publisher: TrainingPublisher,
+    identity: dict,
+    *,
+    lineage: DatasetLineage | None = None,
+) -> None:
+    selected_lineage = lineage or _lineage()
     publisher.publish_experiment()
     publisher.publish_variant(
         identity,
-        dataset_lineage=_lineage(),
+        dataset_lineage=selected_lineage,
         base_model_identity=_base_model(),
     )
     publisher.publish_training_request(
-        dataset_lineage=_lineage(),
+        dataset_lineage=selected_lineage,
         normalized_request=identity["training"],
         base_model_identity=_base_model(),
         publication_mode="storage",
@@ -133,6 +174,7 @@ def _complete(
     staging: Path,
     *,
     retain: bool = False,
+    lineage: DatasetLineage | None = None,
 ):
     ids = publisher.ids
     baseline = [
@@ -152,7 +194,7 @@ def _complete(
     ]
     return publisher.publish_completed_run(
         staging_directory=staging,
-        dataset_lineage=_lineage(),
+        dataset_lineage=lineage or _lineage(),
         base_model_identity=_base_model(),
         adapter_details={"type": "qlora", "format": "peft", "rank": 8},
         resolved_config={"data_order": "source"},
@@ -207,6 +249,21 @@ def test_variant_identity_is_stable_and_semantic(tmp_path: Path) -> None:
         requested_experiment_id="exp-demo",
         requested_run_id="four",
     ).training_variant_id
+
+
+def test_evaluation_package_does_not_change_optimizer_identity(tmp_path: Path) -> None:
+    dataset_only = canonical_variant_identity(
+        _config(tmp_path),
+        _lineage(),
+        base_model_identity=_base_model(),
+    )
+    research_package = canonical_variant_identity(
+        _config(tmp_path),
+        _research_lineage(),
+        base_model_identity=_base_model(),
+    )
+
+    assert research_package == dataset_only
 
 
 def test_retries_have_unique_run_and_adapter_ids() -> None:
@@ -308,6 +365,46 @@ def test_atomic_publication_verifies_and_removes_staging(tmp_path: Path) -> None
         adapter_manifest = json.load(source)
     assert adapter_manifest["dataset"]["dataset_id"] == "demo"
     assert adapter_manifest["dataset"]["dataset_variant_id"] == "dvar-clean"
+    assert "research_package" not in adapter_manifest
+    assert "research_package" not in terminal
+
+
+def test_research_package_lineage_reaches_adapter_and_terminal(tmp_path: Path) -> None:
+    lineage = _research_lineage()
+    publisher, identity = _publisher(tmp_path, lineage=lineage)
+    _prepare(publisher, identity, lineage=lineage)
+    result = _complete(
+        publisher,
+        _adapter_staging(tmp_path),
+        lineage=lineage,
+    )
+
+    with publisher.model_store.open(
+        f"{publisher.adapter_root}/adapter-manifest.json"
+    ) as source:
+        adapter_manifest = json.load(source)
+    with publisher.artifact_store.open(
+        f"{publisher.run_root}/publication-manifest.json"
+    ) as source:
+        terminal = json.load(source)
+
+    expected = {
+        "research_package_id": "pkg",
+        "research_package_version": "4",
+        "manifest_uri": lineage.research_package_manifest_uri,
+        "manifest_checksum": "package-manifest-sha",
+        "evaluation_sets": [dict(lineage.evaluation_sets[0])],
+    }
+    assert adapter_manifest["research_package"] == expected
+    assert terminal["research_package"] == expected
+    assert terminal["dataset_lineage_uri"].endswith("/dataset-lineage.json")
+    assert terminal["dataset_lineage_checksum"] == terminal["artifact_checksums"][
+        "dataset-lineage.json"
+    ]
+    assert verify_published_adapter(
+        result.adapter_manifest_uri,
+        storage_runtime=publisher.storage_runtime,
+    ).valid
 
 
 def test_prediction_jsonl_is_published_with_lineage(tmp_path: Path) -> None:

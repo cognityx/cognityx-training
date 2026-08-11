@@ -398,6 +398,7 @@ class CustomPyTorchTrainerBackend(TrainingBackend):
             "name": self.config.model_name,
             "requested_revision": self.config.model_revision,
             "resolved_revision": getattr(model_config, "_commit_hash", None),
+            "tokenizer_name": self.config.model_name,
             "tokenizer_revision": (
                 getattr(tokenizer, "_commit_hash", None)
                 or self.config.tokenizer_revision

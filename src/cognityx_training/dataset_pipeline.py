@@ -24,6 +24,13 @@ def dataforge_checksum(value: Any) -> str:
     return hashlib.sha256(stable_json(value).encode("utf-8")).hexdigest()
 
 
+def dataforge_manifest_checksum(value: dict[str, Any]) -> str:
+    """Reproduce the provider-neutral checksum carried by DataForge manifests."""
+    return dataforge_checksum(
+        {key: item for key, item in value.items() if key != "manifest_checksum"}
+    )
+
+
 def normalize_checksum(value: str | None) -> str | None:
     if value is None:
         return None
@@ -367,6 +374,11 @@ class DataForgeDatasetReader:
         selected = _load_json_object(self._source, self._context["key"])
         selected_checksum = dataforge_checksum(selected)
         if selected.get("schema") == RESEARCH_PACKAGE_SCHEMA:
+            declared_package_checksum = selected.get("manifest_checksum")
+            if not isinstance(declared_package_checksum, str):
+                raise ValueError("Research package requires manifest_checksum")
+            if dataforge_manifest_checksum(selected) != declared_package_checksum:
+                raise ValueError("Research package manifest checksum verification failed")
             runtime = self._context["runtime"]
             dataset_ref = selected.get("dataset")
             if not isinstance(dataset_ref, dict) or not dataset_ref.get("manifest_uri"):
@@ -385,19 +397,45 @@ class DataForgeDatasetReader:
                 evaluation_manifest, _ = _json_from_uri(uri, runtime)
                 if evaluation_manifest.get("schema") != EVALUATION_SET_SCHEMA:
                     raise ValueError(f"Unsupported evaluation-set schema at {uri}")
+                declared_evaluation_checksum = evaluation_manifest.get(
+                    "manifest_checksum"
+                )
+                if not isinstance(declared_evaluation_checksum, str):
+                    raise ValueError(
+                        f"Evaluation set at {uri} requires manifest_checksum"
+                    )
+                if (
+                    dataforge_manifest_checksum(evaluation_manifest)
+                    != declared_evaluation_checksum
+                ):
+                    raise ValueError(
+                        f"Evaluation-set manifest checksum verification failed at {uri}"
+                    )
                 role = str(evaluation_manifest.get("research_role"))
                 if role in roles:
                     raise ValueError(f"Research package repeats evaluation role: {role}")
                 roles.add(role)
                 if evaluation_manifest.get("training_eligible") is not False:
                     raise ValueError(f"Evaluation set {role} is marked trainable")
-                if evaluation_manifest.get("records_checksum") != item.get("records_checksum"):
-                    raise ValueError(f"Research package checksum mismatch for evaluation role {role}")
+                for field_name in (
+                    "evaluation_set_id",
+                    "evaluation_set_version",
+                    "research_role",
+                    "records_checksum",
+                    "record_count",
+                    "freeze_checksum",
+                    "manifest_checksum",
+                ):
+                    if evaluation_manifest.get(field_name) != item.get(field_name):
+                        raise ValueError(
+                            "Research package evaluation reference mismatch for "
+                            f"{field_name} in role {role}"
+                        )
                 evaluation_manifests.append((uri, evaluation_manifest))
             if "exact_recall" not in roles:
                 raise ValueError("Research package requires an exact_recall evaluation set")
             self._research_package = selected
-            self._research_package_checksum = selected_checksum
+            self._research_package_checksum = declared_package_checksum
             self._evaluation_manifests = evaluation_manifests
         else:
             manifest = selected
@@ -459,6 +497,8 @@ class DataForgeDatasetReader:
                     "records_uri": item.get("records_uri"),
                     "records_checksum": item.get("records_checksum"),
                     "record_count": item.get("record_count"),
+                    "manifest_checksum": item.get("manifest_checksum"),
+                    "freeze_checksum": item.get("freeze_checksum"),
                 }
                 for uri, item in self._evaluation_manifests
             ),

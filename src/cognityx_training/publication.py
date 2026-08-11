@@ -136,14 +136,6 @@ def canonical_variant_identity(
             "manifest_checksum": dataset_lineage.dataset_manifest_checksum,
             "records_checksum": dataset_lineage.records_checksum,
             "recipe": dataset_lineage.recipe,
-            "research_package_manifest_checksum": dataset_lineage.research_package_manifest_checksum,
-            "evaluation_sets": [
-                {
-                    "research_role": item.get("research_role"),
-                    "records_checksum": item.get("records_checksum"),
-                }
-                for item in dataset_lineage.evaluation_sets
-            ],
         },
         "base_model": dict(base_model_identity),
         "training": {
@@ -164,6 +156,19 @@ def canonical_variant_identity(
             "overlength_policy": config.overlength_policy,
             "data_order": config.data_order,
         },
+    }
+
+
+def research_package_lineage(dataset_lineage: Any) -> dict[str, Any] | None:
+    """Return additive research lineage without making it training identity."""
+    if dataset_lineage.research_package_manifest_uri is None:
+        return None
+    return {
+        "research_package_id": dataset_lineage.research_package_id,
+        "research_package_version": dataset_lineage.research_package_version,
+        "manifest_uri": dataset_lineage.research_package_manifest_uri,
+        "manifest_checksum": dataset_lineage.research_package_manifest_checksum,
+        "evaluation_sets": [dict(item) for item in dataset_lineage.evaluation_sets],
     }
 
 
@@ -427,6 +432,7 @@ class TrainingPublisher:
             "files": files,
             "bundle_checksum": calculated_bundle,
         }
+        package_lineage = research_package_lineage(dataset_lineage)
         adapter_manifest = {
             "schema_version": ADAPTER_SCHEMA,
             **self.ids.to_dict(),
@@ -447,6 +453,8 @@ class TrainingPublisher:
             "bundle_checksum": calculated_bundle,
             "created_at": utc_now(),
         }
+        if package_lineage is not None:
+            adapter_manifest["research_package"] = package_lineage
         _write_json(staging_directory / "checksums.json", checksums)
         _write_json(staging_directory / "adapter-manifest.json", adapter_manifest)
 
@@ -502,11 +510,15 @@ class TrainingPublisher:
             "adapter_uri": adapter_object.uri,
             "adapter_manifest_uri": adapter_manifest_uri,
             "training_report_uri": artifact_uris["training-report.json"],
+            "dataset_lineage_uri": artifact_uris["dataset-lineage.json"],
+            "dataset_lineage_checksum": artifact_checksums["dataset-lineage.json"],
             "baseline_predictions_uri": baseline_uri,
             "trained_predictions_uri": trained_uri,
             "artifact_checksums": artifact_checksums,
             "completed_at": utc_now(),
         }
+        if package_lineage is not None:
+            terminal["research_package"] = package_lineage
         terminal_object = self.artifact_store.put_json_idempotent(
             f"{self.run_root}/publication-manifest.json",
             terminal,
