@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import re
-from typing import Any, Mapping, Protocol
 import warnings
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any, Protocol
+
+from cognityx_observability import (
+    ArtifactReference,
+    MLflowExporter,
+    ObservationContext,
+    ObservationSession,
+)
 
 from cognityx_training.storage_uri import resolve_storage_uri
 
@@ -144,7 +152,7 @@ def _metric_segment(value: Any) -> str:
 
 
 class MLflowTracker:
-    """Stream compact events without copying Cognityx artifacts into MLflow."""
+    """Compatibility tracker delegating backend mechanics to Observability."""
 
     def __init__(
         self,
@@ -155,93 +163,66 @@ class MLflowTracker:
         parent_run_id: str | None = None,
         mlflow_module: Any | None = None,
     ) -> None:
-        if mlflow_module is None:
-            try:
-                import mlflow as mlflow_module
-            except ImportError as exc:
-                raise RuntimeError(
-                    "MLflow tracking requires `cognityx-training[tracking]`."
-                ) from exc
-        self.mlflow = mlflow_module
-        self.tracking_uri = tracking_uri
-        self.experiment_name = experiment_name
-        self.run_name = run_name
+        self.exporter = MLflowExporter(
+            tracking_uri=tracking_uri,
+            experiment_name=experiment_name,
+            run_name=run_name,
+            mlflow_module=mlflow_module,
+        )
         self.parent_run_id = parent_run_id
-        self._active = False
-        self._already_tracked = False
-        self._external_run_id: str | None = None
+        self._session: ObservationSession | None = None
 
-    def _existing_run_id(self, idempotency_keys: list[str]) -> str | None:
-        tracking = getattr(self.mlflow, "tracking", None)
-        client_type = getattr(tracking, "MlflowClient", None)
-        if client_type is None:
-            return None
-        client = client_type()
-        experiment = client.get_experiment_by_name(self.experiment_name)
-        if experiment is None:
-            return None
-        for idempotency_key in idempotency_keys:
-            escaped = idempotency_key.replace("'", "\\'")
-            for tag in (
-                "cognityx.idempotency_key",
-                "cognityx.publication_manifest_uri",
-            ):
-                runs = client.search_runs(
-                    [experiment.experiment_id],
-                    filter_string=f"tags.`{tag}` = '{escaped}'",
-                    max_results=1,
-                )
-                if runs:
-                    return str(runs[0].info.run_id)
-        return None
+    @staticmethod
+    def _result(value: Any) -> TrackingResult:
+        return TrackingResult(
+            status="logged" if value.status == "completed" else value.status,
+            backend=value.backend,
+            external_run_id=value.external_run_id,
+        )
 
     def start_run(self, context: Mapping[str, Any]) -> TrackingResult:
-        if self._active:
+        if self._session is not None:
             raise RuntimeError("Tracking run is already active")
-        if self.tracking_uri:
-            self.mlflow.set_tracking_uri(self.tracking_uri)
-        self.mlflow.set_experiment(self.experiment_name)
         identity = dict(context.get("identity") or {})
         supplied_keys = [
             str(value) for value in context.get("idempotency_keys", []) if value
         ]
-        idempotency_keys = list(dict.fromkeys([
-            *supplied_keys,
-            str(identity.get("training_run_id") or ""),
-        ]))
+        idempotency_keys = list(
+            dict.fromkeys(
+                [
+                    *supplied_keys,
+                    str(identity.get("training_run_id") or ""),
+                ]
+            )
+        )
         idempotency_keys = [value for value in idempotency_keys if value]
         if not idempotency_keys:
-            raise ValueError("Tracking context requires a training_run_id or idempotency key")
-        existing = self._existing_run_id(idempotency_keys)
-        if existing:
-            self._already_tracked = True
-            self._external_run_id = existing
-            return TrackingResult(
-                status="already_tracked",
-                backend="mlflow",
-                external_run_id=existing,
+            raise ValueError(
+                "Tracking context requires a training_run_id or idempotency key"
             )
-        tags = {
-            "cognityx.idempotency_key": idempotency_keys[0],
-            "cognityx.artifacts_authority": "cognityx-storage",
-        }
-        if self.parent_run_id:
-            tags["mlflow.parentRunId"] = self.parent_run_id
-        active = self.mlflow.start_run(run_name=self.run_name, tags=tags)
-        self._external_run_id = str(active.info.run_id)
-        self._active = True
-        self.mlflow.log_params(_parameter_values({
-            **identity,
-            **dict(context.get("parameters") or {}),
-        }))
-        metadata = dict(context.get("metadata") or {})
-        if metadata:
-            self.mlflow.set_tags(_parameter_values({"run_metadata": metadata}))
-        return TrackingResult(
-            status="started",
-            backend="mlflow",
-            external_run_id=self._external_run_id,
+        observation = ObservationContext(
+            component="training",
+            operation="optimize",
+            run_id=str(identity.get("training_run_id") or "") or None,
+            parent_run_id=self.parent_run_id,
+            idempotency_key=idempotency_keys[0],
+            attributes={
+                **identity,
+                "parameters": dict(context.get("parameters") or {}),
+                "run_metadata": dict(context.get("metadata") or {}),
+            },
         )
+        self._session = ObservationSession(
+            observation,
+            self.exporter,
+            failure_policy="error",
+        )
+        return self._result(self._session.start())
+
+    def _active_session(self) -> ObservationSession | None:
+        if self._session is None or self._session.result.status == "already_tracked":
+            return None
+        return self._session
 
     def log_metrics(
         self,
@@ -249,15 +230,8 @@ class MLflowTracker:
         *,
         step: int | None = None,
     ) -> None:
-        if not self._active:
-            return
-        values = _metric_values(metrics)
-        if not values:
-            return
-        if step is None:
-            self.mlflow.log_metrics(values)
-        else:
-            self.mlflow.log_metrics(values, step=step)
+        if session := self._active_session():
+            session.metrics(_metric_values(metrics), step=step)
 
     def log_evaluation(
         self,
@@ -266,7 +240,8 @@ class MLflowTracker:
         *,
         step: int | None = None,
     ) -> None:
-        if not self._active:
+        session = self._active_session()
+        if session is None:
             return
         phase = _metric_segment(suite_identity.get("phase") or "evaluation")
         role = _metric_segment(
@@ -275,84 +250,66 @@ class MLflowTracker:
             or "suite"
         )
         prefix = f"evaluation.{phase}.{role}"
-        self.log_metrics(
-            {f"{prefix}.{key}": value for key, value in _metric_values(metrics).items()},
+        session.metrics(
+            {
+                f"{prefix}.{key}": value
+                for key, value in _metric_values(metrics).items()
+            },
             step=step,
         )
-        self.mlflow.set_tags(_parameter_values({
-            f"cognityx.{prefix}.identity": dict(suite_identity)
-        }))
+        session.event(
+            "training.evaluation",
+            attributes={"metric_prefix": prefix, **dict(suite_identity)},
+        )
 
     def log_artifact_references(
         self,
         references: Mapping[str, Any],
         checksums: Mapping[str, Any],
     ) -> None:
-        if not self._active:
+        session = self._active_session()
+        if session is None:
             return
-        tags = _parameter_values({
-            "artifact_references": dict(references),
-            "artifact_checksums": dict(checksums),
-        })
-        publication_uri = references.get("publication_manifest_uri")
-        if publication_uri:
-            tags["cognityx.publication_manifest_uri"] = str(publication_uri)[:500]
-        self.mlflow.set_tags(tags)
+        session.artifacts(
+            ArtifactReference(
+                name=str(name),
+                uri=str(uri),
+                checksum=(
+                    str(
+                        checksums.get(name)
+                        or checksums.get(str(name).removesuffix("_uri"))
+                    )
+                    if checksums.get(name)
+                    or checksums.get(str(name).removesuffix("_uri"))
+                    else None
+                ),
+            )
+            for name, uri in references.items()
+            if uri
+        )
+        if checksums:
+            session.event(
+                "training.artifact_checksums",
+                attributes=dict(checksums),
+            )
 
     def finish(
         self,
         status: str,
         final_metadata: Mapping[str, Any],
     ) -> TrackingResult:
-        if self._already_tracked:
-            return TrackingResult(
-                status="already_tracked",
-                backend="mlflow",
-                external_run_id=self._external_run_id,
-            )
-        if not self._active:
+        if self._session is None:
             raise RuntimeError("No active tracking run to finish")
-        self.mlflow.set_tags(_parameter_values({
-            "run_status": status,
-            "final_metadata": dict(final_metadata),
-        }))
-        self.mlflow.end_run(status="FINISHED" if status == "completed" else status.upper())
-        self._active = False
-        return TrackingResult(
-            status="logged",
-            backend="mlflow",
-            external_run_id=self._external_run_id,
-        )
+        return self._result(self._session.finish(status, attributes=final_metadata))
 
     def fail(
         self,
         error: BaseException | str,
         failure_metadata: Mapping[str, Any],
     ) -> TrackingResult:
-        if self._already_tracked:
-            return TrackingResult(
-                status="already_tracked",
-                backend="mlflow",
-                external_run_id=self._external_run_id,
-            )
-        if not self._active:
-            return TrackingResult(
-                status="not_started",
-                backend="mlflow",
-                external_run_id=self._external_run_id,
-            )
-        self.mlflow.set_tags(_parameter_values({
-            "failure.error_type": type(error).__name__,
-            "failure.error": str(error),
-            "failure.metadata": dict(failure_metadata),
-        }))
-        self.mlflow.end_run(status="FAILED")
-        self._active = False
-        return TrackingResult(
-            status="failed",
-            backend="mlflow",
-            external_run_id=self._external_run_id,
-        )
+        if self._session is None:
+            return TrackingResult(status="not_started", backend="mlflow")
+        return self._result(self._session.fail(error, attributes=failure_metadata))
 
     def log_completed_run(self, payload: Mapping[str, Any]) -> TrackingResult:
         """Register a historical payload through the lifecycle API."""
@@ -392,7 +349,7 @@ class TrackingSession:
     def start_run(self, context: Mapping[str, Any]) -> TrackingResult:
         try:
             self._result = self.tracker.start_run(context)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - configured safety boundary
             return self._failed(exc)
         if self._result.status in {"disabled", "already_tracked"}:
             self._disabled = True
@@ -408,7 +365,7 @@ class TrackingSession:
             return
         try:
             self.tracker.log_metrics(metrics, step=step)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - configured safety boundary
             self._failed(exc)
 
     def log_evaluation(
@@ -422,7 +379,7 @@ class TrackingSession:
             return
         try:
             self.tracker.log_evaluation(suite_identity, metrics, step=step)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - configured safety boundary
             self._failed(exc)
 
     def log_artifact_references(
@@ -434,7 +391,7 @@ class TrackingSession:
             return
         try:
             self.tracker.log_artifact_references(references, checksums)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - configured safety boundary
             self._failed(exc)
 
     def finish(
@@ -446,7 +403,7 @@ class TrackingSession:
             return self._result
         try:
             self._result = self.tracker.finish(status, final_metadata)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - configured safety boundary
             return self._failed(exc)
         return self._result
 
@@ -459,7 +416,7 @@ class TrackingSession:
             return self._result
         try:
             self._result = self.tracker.fail(error, failure_metadata)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - configured safety boundary
             return self._failed(exc)
         return self._result
 
@@ -507,7 +464,7 @@ def create_tracking_session(
             run_name=run_name,
             parent_run_id=parent_run_id,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - configured safety boundary
         session = TrackingSession(NoOpTracker(), failure_policy=failure_policy)
         session._result = TrackingResult(status="not_started", backend=backend)
         session._failed(exc)
@@ -532,21 +489,27 @@ def track_with_policy(
         **dict(payload.get("run_metadata") or {}),
     }
     idempotency_keys = [
-        value for value in (
+        value
+        for value in (
             references.get("publication_manifest_uri"),
             identity.get("training_run_id"),
-        ) if value
+        )
+        if value
     ]
-    session.start_run({
-        "identity": identity,
-        "parameters": dict(payload.get("parameters") or {}),
-        "metadata": run_metadata,
-        "idempotency_keys": idempotency_keys,
-    })
-    session.log_metrics({
-        **dict(payload.get("metrics") or {}),
-        **dict(payload.get("resources") or {}),
-    })
+    session.start_run(
+        {
+            "identity": identity,
+            "parameters": dict(payload.get("parameters") or {}),
+            "metadata": run_metadata,
+            "idempotency_keys": idempotency_keys,
+        }
+    )
+    session.log_metrics(
+        {
+            **dict(payload.get("metrics") or {}),
+            **dict(payload.get("resources") or {}),
+        }
+    )
     for evaluation in payload.get("evaluations") or []:
         session.log_evaluation(
             dict(evaluation.get("suite_identity") or {}),
@@ -597,7 +560,7 @@ def completed_run_payload(
     resources: Mapping[str, Any],
     artifact_references: Mapping[str, Any],
     artifact_checksums: Mapping[str, Any],
-    evaluations: list[Mapping[str, Any]] | None = None,
+    evaluations: Sequence[Mapping[str, Any]] | None = None,
     run_metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
@@ -618,17 +581,21 @@ def _read_json_uri(storage_runtime: Any, uri: str) -> tuple[dict[str, Any], Any,
     with resolution.store.open(resolution.key) as source:
         value = json.load(source)
     if not isinstance(value, dict):
-        raise ValueError(f"Stored JSON is not an object: {uri}")
+        raise TypeError(f"Stored JSON is not an object: {uri}")
     return value, resolution.store, resolution.key
 
 
-def payload_from_publication(storage_runtime: Any, publication_manifest_uri: str) -> dict[str, Any]:
+def payload_from_publication(
+    storage_runtime: Any, publication_manifest_uri: str
+) -> dict[str, Any]:
     publication, store, key = _read_json_uri(storage_runtime, publication_manifest_uri)
     if (
         publication.get("schema_version") != "cognityx.training.publication/v1"
         or publication.get("status") != "completed"
     ):
-        raise ValueError("Tracking backfill requires a completed training publication manifest")
+        raise ValueError(
+            "Tracking backfill requires a completed training publication manifest"
+        )
     root = key.rsplit("/", 1)[0]
     with store.open(f"{root}/metrics.json") as source:
         metrics = json.load(source)
@@ -638,22 +605,34 @@ def payload_from_publication(storage_runtime: Any, publication_manifest_uri: str
     for phase in ("baseline", "trained"):
         evaluation = dict((report.get("evaluation") or {}).get(phase) or {})
         for role, suite_metrics in (evaluation.get("suite_metrics") or {}).items():
-            evaluations.append({
-                "suite_identity": {
-                    "phase": phase,
-                    "research_role": role,
-                    "evaluation_sets": list(suite_metrics.get("evaluation_sets") or []),
-                },
-                "metrics": {
-                    name: value for name, value in suite_metrics.items()
-                    if isinstance(value, (int, float)) and not isinstance(value, bool)
-                },
-                "step": 0 if phase == "baseline" else metrics.get("train_steps"),
-            })
+            evaluations.append(
+                {
+                    "suite_identity": {
+                        "phase": phase,
+                        "research_role": role,
+                        "evaluation_sets": list(
+                            suite_metrics.get("evaluation_sets") or []
+                        ),
+                    },
+                    "metrics": {
+                        name: value
+                        for name, value in suite_metrics.items()
+                        if isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                    },
+                    "step": 0 if phase == "baseline" else metrics.get("train_steps"),
+                }
+            )
     return completed_run_payload(
-        identity={name: publication.get(name) for name in (
-            "experiment_id", "training_variant_id", "training_run_id", "adapter_id"
-        )},
+        identity={
+            name: publication.get(name)
+            for name in (
+                "experiment_id",
+                "training_variant_id",
+                "training_run_id",
+                "adapter_id",
+            )
+        },
         parameters=dict(report.get("configuration") or {}),
         metrics=dict(metrics or {}),
         resources={
