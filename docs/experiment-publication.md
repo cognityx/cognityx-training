@@ -133,6 +133,13 @@ Use `verify_published_adapter(adapter_manifest_uri, storage_runtime=runtime)` to
 verify a candidate through Storage read streams without loading its base model,
 requiring a native backend path, or allocating a GPU.
 
+An orchestrator may keep the reviewed TOML file as the training recipe while
+supplying one frozen run's changing references on the command line:
+`--dataset-uri`, `--seed`, `--run-id`, `--experiment-id`, and
+`--parent-run-id`. These options replace only their matching values. They let
+Experiments pass the authoritative DataForge package and deterministic run
+identity without rewriting model or optimizer logic.
+
 The base-model identity names the tokenizer source actually passed to
 Transformers, together with its resolved revision and chat-template checksum.
 This makes the text-to-token rules visible without inventing a separate

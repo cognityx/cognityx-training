@@ -24,7 +24,6 @@ class FakeMLflow:
     def __init__(self) -> None:
         self.tracking_uri = None
         self.experiment_name = None
-        self.params = {}
         self.metric_events = []
         self.tags = {}
         self.start_tags = {}
@@ -33,12 +32,19 @@ class FakeMLflow:
         owner = self
 
         class Client:
+            def __init__(self, **kwargs):
+                del kwargs
+
             def get_experiment_by_name(self, name):
                 return SimpleNamespace(experiment_id="experiment-1")
 
             def search_runs(self, *args, **kwargs):
                 if owner.existing_run_id:
-                    return [SimpleNamespace(info=SimpleNamespace(run_id=owner.existing_run_id))]
+                    return [
+                        SimpleNamespace(
+                            info=SimpleNamespace(run_id=owner.existing_run_id)
+                        )
+                    ]
                 return []
 
         self.tracking = SimpleNamespace(MlflowClient=Client)
@@ -53,11 +59,11 @@ class FakeMLflow:
         self.start_tags = tags
         return SimpleNamespace(info=SimpleNamespace(run_id="external-run-1"))
 
-    def log_params(self, values):
-        self.params.update(values)
+    def log_metric(self, name, value, *, step=None):
+        self.metric_events.append((step, name, value))
 
-    def log_metrics(self, values, *, step=None):
-        self.metric_events.append((step, dict(values)))
+    def set_tag(self, name, value):
+        self.tags[name] = value
 
     def set_tags(self, values):
         self.tags.update(values)
@@ -72,15 +78,19 @@ def _payload():
         parameters={"training": {"learning_rate": 0.001}},
         metrics={"train_loss": 0.5, "evaluation_suite_counts": {"exact_recall": 2}},
         resources={"ram_peak_bytes": 10},
-        evaluations=[{
-            "suite_identity": {
-                "phase": "trained",
-                "research_role": "exact_recall",
-                "evaluation_sets": [{"evaluation_set_id": "eval-1", "evaluation_set_version": "1"}],
-            },
-            "metrics": {"exact_match_accuracy": 1.0},
-            "step": 2,
-        }],
+        evaluations=[
+            {
+                "suite_identity": {
+                    "phase": "trained",
+                    "research_role": "exact_recall",
+                    "evaluation_sets": [
+                        {"evaluation_set_id": "eval-1", "evaluation_set_version": "1"}
+                    ],
+                },
+                "metrics": {"exact_match_accuracy": 1.0},
+                "step": 2,
+            }
+        ],
         run_metadata={
             "original_started_at": "2026-08-01T00:00:00+00:00",
             "original_finished_at": "2026-08-01T00:01:00+00:00",
@@ -95,7 +105,9 @@ def _payload():
 
 def test_noop_and_mlflow_lifecycle_are_compact_and_idempotent():
     noop = NoOpTracker()
-    assert noop.start_run({"identity": {"training_run_id": "run-1"}}).status == "disabled"
+    assert (
+        noop.start_run({"identity": {"training_run_id": "run-1"}}).status == "disabled"
+    )
 
     fake = FakeMLflow()
     tracker = MLflowTracker(
@@ -105,17 +117,21 @@ def test_noop_and_mlflow_lifecycle_are_compact_and_idempotent():
         parent_run_id="parent-1",
         mlflow_module=fake,
     )
-    started = tracker.start_run({
-        "identity": {"experiment_id": "exp-1", "training_run_id": "run-1"},
-        "parameters": {"training": {"learning_rate": 0.001}},
-        "metadata": {"registration_mode": "live"},
-    })
+    started = tracker.start_run(
+        {
+            "identity": {"experiment_id": "exp-1", "training_run_id": "run-1"},
+            "parameters": {"training": {"learning_rate": 0.001}},
+            "metadata": {"registration_mode": "live"},
+        }
+    )
     tracker.log_metrics({"train_loss": 0.5}, step=1)
     tracker.log_evaluation(
         {
             "phase": "baseline",
             "research_role": "exact_recall",
-            "evaluation_sets": [{"evaluation_set_id": "eval-1", "evaluation_set_version": "1"}],
+            "evaluation_sets": [
+                {"evaluation_set_id": "eval-1", "evaluation_set_version": "1"}
+            ],
         },
         {"exact_match_accuracy": 0.25},
         step=0,
@@ -134,13 +150,20 @@ def test_noop_and_mlflow_lifecycle_are_compact_and_idempotent():
     assert result.external_run_id == "external-run-1"
     assert fake.tracking_uri == "sqlite:///tracking.db"
     assert fake.experiment_name == "qualification"
-    assert fake.params["training.learning_rate"] == "0.001"
-    assert fake.metric_events[0] == (1, {"train_loss": 0.5})
+    assert "learning_rate" in fake.start_tags["cognityx.parameters"]
+    assert fake.metric_events[0] == (1, "train_loss", 0.5)
     assert fake.metric_events[1][0] == 0
-    assert fake.metric_events[1][1]["evaluation.baseline.exact_recall.exact_match_accuracy"] == 0.25
+    assert (
+        fake.metric_events[1][1]
+        == "evaluation.baseline.exact_recall.exact_match_accuracy"
+    )
+    assert fake.metric_events[1][2] == 0.25
     assert fake.start_tags["mlflow.parentRunId"] == "parent-1"
-    assert fake.tags["artifact_references.adapter_uri"].startswith("storage://")
-    assert fake.tags["cognityx.publication_manifest_uri"].startswith("storage://")
+    assert fake.start_tags["cognityx.component"] == "training"
+    assert fake.tags["cognityx.storage.adapter_uri.uri"].startswith("storage://")
+    assert fake.tags["cognityx.storage.publication_manifest_uri.uri"].startswith(
+        "storage://"
+    )
     assert fake.end_status == "FINISHED"
     assert not hasattr(fake, "log_artifact")
 
@@ -150,10 +173,14 @@ def test_noop_and_mlflow_lifecycle_are_compact_and_idempotent():
         tracking_uri=None,
         experiment_name="qualification",
         mlflow_module=repeated_fake,
-    ).start_run({
-        "identity": {"training_run_id": "run-1"},
-        "idempotency_keys": ["storage://local-main/runs/run-1/publication-manifest.json"],
-    })
+    ).start_run(
+        {
+            "identity": {"training_run_id": "run-1"},
+            "idempotency_keys": [
+                "storage://local-main/runs/run-1/publication-manifest.json"
+            ],
+        }
+    )
     assert repeated.status == "already_tracked"
     assert repeated.external_run_id == "existing-run"
 
@@ -164,7 +191,9 @@ class RecordingTracker:
 
     def start_run(self, context):
         self.events.append(("start", dict(context)))
-        return TrackingResult(status="started", backend="fake", external_run_id="fake-1")
+        return TrackingResult(
+            status="started", backend="fake", external_run_id="fake-1"
+        )
 
     def log_metrics(self, metrics, *, step=None):
         self.events.append(("metrics", step, dict(metrics)))
@@ -189,7 +218,11 @@ def test_backfill_replays_required_event_order_and_original_times():
     result = track_with_policy(tracker, _payload(), failure_policy="warn")
     assert result.status == "logged"
     assert [event[0] for event in tracker.events] == [
-        "start", "metrics", "evaluation", "artifacts", "finish"
+        "start",
+        "metrics",
+        "evaluation",
+        "artifacts",
+        "finish",
     ]
     start_metadata = tracker.events[0][1]["metadata"]
     assert start_metadata["registration_mode"] == "backfill"
@@ -262,7 +295,9 @@ def test_live_metrics_use_measured_values_and_explicit_resource_scope():
     assert metrics["training.examples_per_second"] == 0.8
     assert metrics["training.input_tokens_per_second"] == 20.0
     assert metrics["resource.host.wsl_vm.ram_used_bytes"] == 300
-    assert metrics["resource.gpu.whole_device.device_0.accumulated_energy_joules"] == 250.0
+    assert (
+        metrics["resource.gpu.whole_device.device_0.accumulated_energy_joules"] == 250.0
+    )
 
 
 def test_evaluation_events_retain_research_suite_identity():
@@ -273,10 +308,12 @@ def test_evaluation_events_retain_research_suite_identity():
                     "example_count": 2,
                     "exact_match_accuracy": 0.5,
                     "record_ids": ["one", "two"],
-                    "evaluation_sets": [{
-                        "evaluation_set_id": "eval-paraphrase",
-                        "evaluation_set_version": "version-1",
-                    }],
+                    "evaluation_sets": [
+                        {
+                            "evaluation_set_id": "eval-paraphrase",
+                            "evaluation_set_version": "version-1",
+                        }
+                    ],
                 }
             }
         },
@@ -286,55 +323,69 @@ def test_evaluation_events_retain_research_suite_identity():
     assert identity == {
         "phase": "baseline",
         "research_role": "paraphrase_evaluation",
-        "evaluation_sets": [{
-            "evaluation_set_id": "eval-paraphrase",
-            "evaluation_set_version": "version-1",
-        }],
+        "evaluation_sets": [
+            {
+                "evaluation_set_id": "eval-paraphrase",
+                "evaluation_set_version": "version-1",
+            }
+        ],
     }
     assert metrics == {"example_count": 2.0, "exact_match_accuracy": 0.5}
 
 
-def test_completed_publication_backfill_preserves_times_and_storage_references(tmp_path):
-    runtime = StorageRuntime.from_config(StorageConfig.built_in(root=tmp_path / "storage"))
+def test_completed_publication_backfill_preserves_times_and_storage_references(
+    tmp_path,
+):
+    runtime = StorageRuntime.from_config(
+        StorageConfig.built_in(root=tmp_path / "storage")
+    )
     store = runtime.for_role("artifact")
     root = "experiments/exp-1/runs/run-1"
     store.put_json(f"{root}/metrics.json", {"train_loss": 0.25, "train_steps": 2})
-    store.put_json(f"{root}/training-report.json", {
-        "started_at": "2026-08-01T00:00:00+00:00",
-        "finished_at": "2026-08-01T00:01:00+00:00",
-        "duration_seconds": 60.0,
-        "configuration": {"learning_rate": 0.001},
-        "system_usage": {"ram_peak_bytes": 100},
-        "gpu_usage": [],
-        "evaluation": {
-            "baseline": {
-                "suite_metrics": {
-                    "exact_recall": {
-                        "example_count": 1,
-                        "exact_match_accuracy": 1.0,
-                        "evaluation_sets": [{
-                            "evaluation_set_id": "eval-1",
-                            "evaluation_set_version": "1",
-                        }],
+    store.put_json(
+        f"{root}/training-report.json",
+        {
+            "started_at": "2026-08-01T00:00:00+00:00",
+            "finished_at": "2026-08-01T00:01:00+00:00",
+            "duration_seconds": 60.0,
+            "configuration": {"learning_rate": 0.001},
+            "system_usage": {"ram_peak_bytes": 100},
+            "gpu_usage": [],
+            "evaluation": {
+                "baseline": {
+                    "suite_metrics": {
+                        "exact_recall": {
+                            "example_count": 1,
+                            "exact_match_accuracy": 1.0,
+                            "evaluation_sets": [
+                                {
+                                    "evaluation_set_id": "eval-1",
+                                    "evaluation_set_version": "1",
+                                }
+                            ],
+                        }
                     }
                 }
-            }
+            },
         },
-    })
-    publication_uri = store.put_json(f"{root}/publication-manifest.json", {
-        "schema_version": "cognityx.training.publication/v1",
-        "status": "completed",
-        "experiment_id": "exp-1",
-        "training_variant_id": "variant-1",
-        "training_run_id": "run-1",
-        "adapter_id": "adapter-1",
-        "adapter_uri": "storage://local-main/models/adapters/adapter-1/1",
-        "adapter_manifest_uri": "storage://local-main/models/adapters/adapter-1/1/adapter-manifest.json",
-        "training_report_uri": store.uri(f"{root}/training-report.json"),
-        "baseline_predictions_uri": store.uri(f"{root}/baseline-predictions.jsonl"),
-        "trained_predictions_uri": store.uri(f"{root}/trained-predictions.jsonl"),
-        "artifact_checksums": {"adapter_bundle": "abc"},
-    }).uri
+    )
+    publication_uri = store.put_json(
+        f"{root}/publication-manifest.json",
+        {
+            "schema_version": "cognityx.training.publication/v1",
+            "status": "completed",
+            "experiment_id": "exp-1",
+            "training_variant_id": "variant-1",
+            "training_run_id": "run-1",
+            "adapter_id": "adapter-1",
+            "adapter_uri": "storage://local-main/models/adapters/adapter-1/1",
+            "adapter_manifest_uri": "storage://local-main/models/adapters/adapter-1/1/adapter-manifest.json",
+            "training_report_uri": store.uri(f"{root}/training-report.json"),
+            "baseline_predictions_uri": store.uri(f"{root}/baseline-predictions.jsonl"),
+            "trained_predictions_uri": store.uri(f"{root}/trained-predictions.jsonl"),
+            "artifact_checksums": {"adapter_bundle": "abc"},
+        },
+    ).uri
     payload = payload_from_publication(runtime, publication_uri)
     assert payload["identity"]["training_run_id"] == "run-1"
     assert payload["metrics"]["train_loss"] == 0.25
@@ -344,7 +395,12 @@ def test_completed_publication_backfill_preserves_times_and_storage_references(t
         "original_finished_at": "2026-08-01T00:01:00+00:00",
         "original_duration_seconds": 60.0,
     }
-    assert payload["evaluations"][0]["suite_identity"]["evaluation_sets"][0]["evaluation_set_id"] == "eval-1"
+    assert (
+        payload["evaluations"][0]["suite_identity"]["evaluation_sets"][0][
+            "evaluation_set_id"
+        ]
+        == "eval-1"
+    )
     assert payload["artifact_references"]["publication_manifest_uri"] == publication_uri
     assert payload["artifact_checksums"]["adapter_bundle"] == "abc"
 
@@ -356,10 +412,12 @@ def test_local_sqlite_mlflow_when_optional_dependency_is_installed(tmp_path):
         experiment_name="cognityx-test",
         mlflow_module=mlflow,
     )
-    started = tracker.start_run({
-        "identity": {"training_run_id": "local-file-backed-run"},
-        "parameters": {"seed": 7},
-    })
+    started = tracker.start_run(
+        {
+            "identity": {"training_run_id": "local-file-backed-run"},
+            "parameters": {"seed": 7},
+        }
+    )
     tracker.log_metrics({"loss": 0.5}, step=1)
     result = tracker.finish("completed", {"registration_mode": "test"})
     assert started.status == "started"

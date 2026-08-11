@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.11"
 dependencies = [
     "cognityx-core",
+    "cognityx-observability",
     "cognityx-storage",
 ]
 
@@ -39,7 +40,9 @@ cognityx-track-publication = "cognityx_training.tracking_cli:main"
 dev = [
     "mkdocs-material>=9.5",
     "mkdocstrings-python>=1.12",
+    "mypy>=1.17",
     "pytest>=8.0",
+    "ruff>=0.12",
 ]
 
 [tool.pytest.ini_options]
@@ -48,6 +51,7 @@ testpaths = ["tests"]
 [tool.uv.sources]
 cognityx-core = { git = "https://github.com/cognityx/cognityx-core.git" }
 cognityx-inference = { git = "https://github.com/cognityx/cognityx-inference.git" }
+cognityx-observability = { git = "https://github.com/cognityx/cognityx-observability.git", rev = "b02ec3c103d0b3fd22b7c33888155b763d6baa9f" }
 cognityx-storage = { git = "https://github.com/cognityx/cognityx-storage.git" }
 
 [build-system]

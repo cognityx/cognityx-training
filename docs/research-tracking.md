@@ -67,6 +67,12 @@ named evaluation suites, attach Storage references, and finish or fail. The
 default implementation does nothing (a `NoOpTracker`), so tracking cannot
 become an accidental requirement.
 
+The public Training tracker classes now act as compatibility adapters over
+`cognityx-observability`. The shared package owns NoOp and MLflow exporter
+mechanics, parent relationships, idempotency, Storage references, and failure
+containment. Training still owns its metric names, evaluation-suite identities,
+and historical publication backfill payloads.
+
 Measurements are emitted at the existing progress interval. Process and host
 measurements name their scope—for example, the Python process versus the whole
 WSL virtual machine. GPU utilization, memory, power, and accumulated energy are
