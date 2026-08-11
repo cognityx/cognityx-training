@@ -59,7 +59,10 @@ version = "3"
 uri = "storage://local-main/datasets/enterprise-kuqa/3/manifest.json"
 ```
 
-`--experiment-id` overrides the configured experiment ID. `--run-id` remains a
+`--experiment-id` overrides the configured experiment ID before the effective
+configuration is validated. This lets an orchestrator replace a research-facing
+identifier with Training's required `exp-*` lineage identifier without weakening
+validation. `--run-id` remains a
 compatibility alias and is normalized to a `trun-*` training run ID.
 
 Storage is resolved once and shared by dataset reading and publication, in this

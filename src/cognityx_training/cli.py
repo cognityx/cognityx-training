@@ -4,7 +4,7 @@ import argparse
 import json
 import os
 import tomllib
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from pathlib import Path
 
 from cognityx_core import Dataset, TrainingRequest
@@ -70,68 +70,60 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def resolve_training_config(
+    values: dict[str, object], args: argparse.Namespace
+) -> CustomPyTorchTrainingConfig:
+    """Compose TOML values and CLI overrides before validating once."""
+    training = dict(values.get("training") or {})
+    experiment_values = dict(values.get("experiment") or {})
+    publication_values = dict(values.get("publication") or {})
+    tracking_values = dict(values.get("tracking") or {})
+    effective: dict[str, object] = {
+        **training,
+        "experiment_id": experiment_values.get("id"),
+        "experiment_name": experiment_values.get("name"),
+        "experiment_description": experiment_values.get("description"),
+        "experiment_created_by": experiment_values.get("created_by"),
+        "experiment_tags": experiment_values.get("tags", []),
+        "publication_mode": publication_values.get("mode", "local"),
+        "retain_local_staging": publication_values.get(
+            "retain_local_staging",
+            False,
+        ),
+        "tracking_backend": tracking_values.get("backend", "none"),
+        "tracking_uri": tracking_values.get("uri"),
+        "tracking_experiment_name": tracking_values.get("experiment_name"),
+        "tracking_run_name": tracking_values.get("run_name"),
+        "tracking_parent_run_id": tracking_values.get("parent_run_id"),
+        "tracking_failure_policy": tracking_values.get("failure_policy", "warn"),
+    }
+    if args.output_dir is not None:
+        effective["output_dir"] = args.output_dir
+    if args.run_id is not None:
+        effective["run_id"] = None
+        effective["training_run_id"] = args.run_id
+    if args.experiment_id is not None:
+        effective["experiment_id"] = args.experiment_id
+    if args.seed is not None:
+        effective["seed"] = args.seed
+    if args.parent_run_id is not None:
+        effective["tracking_parent_run_id"] = args.parent_run_id
+    if args.storage_config is not None:
+        effective["storage_config"] = args.storage_config
+    if args.storage_root is not None:
+        effective["storage_root"] = args.storage_root
+    if args.dataset_input_mode is not None:
+        effective["dataset_input_mode"] = args.dataset_input_mode
+    return CustomPyTorchTrainingConfig.from_mapping(effective)
+
+
 def main(argv: list[str] | None = None) -> None:
     """Load TOML configuration and run the selected backend."""
     args = parse_args(argv)
     with args.config.open("rb") as source:
         values = tomllib.load(source)
-    training = values.get("training", {})
-    experiment_values = values.get("experiment", {})
-    publication_values = values.get("publication", {})
     dataset_values = values.get("dataset", {})
-    tracking_values = values.get("tracking", {})
-    config = CustomPyTorchTrainingConfig.from_mapping(
-        {
-            **training,
-            "experiment_id": experiment_values.get("id"),
-            "experiment_name": experiment_values.get("name"),
-            "experiment_description": experiment_values.get("description"),
-            "experiment_created_by": experiment_values.get("created_by"),
-            "experiment_tags": experiment_values.get("tags", []),
-            "publication_mode": publication_values.get("mode", "local"),
-            "retain_local_staging": publication_values.get(
-                "retain_local_staging",
-                False,
-            ),
-            "tracking_backend": tracking_values.get("backend", "none"),
-            "tracking_uri": tracking_values.get("uri"),
-            "tracking_experiment_name": tracking_values.get("experiment_name"),
-            "tracking_run_name": tracking_values.get("run_name"),
-            "tracking_parent_run_id": tracking_values.get("parent_run_id"),
-            "tracking_failure_policy": tracking_values.get("failure_policy", "warn"),
-        }
-    )
-    if (
-        args.output_dir is not None
-        or args.run_id is not None
-        or args.experiment_id is not None
-        or args.seed is not None
-        or args.parent_run_id is not None
-    ):
-        config = replace(
-            config,
-            output_dir=args.output_dir or config.output_dir,
-            run_id=None if args.run_id is not None else config.run_id,
-            training_run_id=args.run_id or config.training_run_id,
-            experiment_id=args.experiment_id or config.experiment_id,
-            seed=args.seed if args.seed is not None else config.seed,
-            tracking_parent_run_id=(
-                args.parent_run_id or config.tracking_parent_run_id
-            ),
-        )
-        config.validate()
-    if (
-        args.storage_config is not None
-        or args.storage_root is not None
-        or args.dataset_input_mode is not None
-    ):
-        config = replace(
-            config,
-            storage_config=args.storage_config or config.storage_config,
-            storage_root=args.storage_root or config.storage_root,
-            dataset_input_mode=args.dataset_input_mode or config.dataset_input_mode,
-        )
-        config.validate()
+    config = resolve_training_config(values, args)
     dataset = Dataset(
         name=dataset_values["name"],
         version=str(dataset_values.get("version", "1")),
