@@ -16,7 +16,9 @@ from typing import Any, Iterable, Mapping
 
 from cognityx_training.lineage import (
     TrainingLineageIds,
+    experiment_id,
     stable_json,
+    training_run_id,
     variant_identity_checksum,
 )
 from cognityx_training.reporting import utc_now
@@ -326,6 +328,96 @@ class TrainingPublisher:
     @property
     def adapter_root(self) -> str:
         return f"adapters/{self.ids.adapter_id}/1"
+
+    @classmethod
+    def find_completed_run(
+        cls,
+        storage_runtime: Any,
+        *,
+        requested_experiment_id: str,
+        requested_training_run_id: str,
+        experiment_name: str | None = None,
+        experiment_description: str | None = None,
+        experiment_created_by: str | None = None,
+        experiment_tags: Iterable[str] = (),
+    ) -> tuple[TrainingPublisher, PublicationResult] | None:
+        """Find and verify a terminal publication from caller-stable IDs alone."""
+        selected_experiment_id = experiment_id(requested_experiment_id)
+        selected_training_run_id = training_run_id(requested_training_run_id)
+        key = (
+            f"experiments/{selected_experiment_id}/runs/"
+            f"{selected_training_run_id}/publication-manifest.json"
+        )
+        artifact_store = storage_runtime.for_role("artifact")
+        if not artifact_store.exists(key):
+            return None
+        terminal = _read_json(artifact_store, key)
+        ids = TrainingLineageIds(
+            experiment_id=selected_experiment_id,
+            training_variant_id=str(terminal.get("training_variant_id") or ""),
+            training_run_id=selected_training_run_id,
+            adapter_id=str(terminal.get("adapter_id") or ""),
+        )
+        publisher = cls(
+            storage_runtime,
+            ids,
+            experiment_name=experiment_name,
+            experiment_description=experiment_description,
+            experiment_created_by=experiment_created_by,
+            experiment_tags=experiment_tags,
+        )
+        publication = publisher.load_completed_run()
+        if publication is None:  # pragma: no cover - guarded by the existence check
+            raise RuntimeError(
+                "Completed Training publication disappeared during reuse"
+            )
+        return publisher, publication
+
+    def load_completed_run(self) -> PublicationResult | None:
+        """Return a verified caller-stable terminal publication when it exists."""
+        key = f"{self.run_root}/publication-manifest.json"
+        if not self.artifact_store.exists(key):
+            return None
+        terminal = _read_json(self.artifact_store, key)
+        if terminal.get("schema_version") != PUBLICATION_SCHEMA:
+            raise ValueError("Existing Training publication has an unsupported schema")
+        if terminal.get("status") != "completed":
+            raise ValueError("Existing Training publication is not completed")
+        for name, expected in self.ids.to_dict().items():
+            if terminal.get(name) != expected:
+                raise ValueError(
+                    f"Existing Training publication does not match requested {name}"
+                )
+        required = (
+            "adapter_uri",
+            "adapter_manifest_uri",
+            "training_report_uri",
+            "baseline_predictions_uri",
+            "trained_predictions_uri",
+        )
+        for name in required:
+            if not isinstance(terminal.get(name), str) or not terminal[name]:
+                raise ValueError(
+                    f"Existing Training publication is missing required {name}"
+                )
+        verification = verify_published_adapter(
+            str(terminal["adapter_manifest_uri"]),
+            storage_runtime=self.storage_runtime,
+        )
+        artifact_checksums = dict(terminal.get("artifact_checksums") or {})
+        if artifact_checksums.get("adapter_bundle") != verification.bundle_checksum:
+            raise ValueError(
+                "Existing Training publication adapter checksum does not match"
+            )
+        return PublicationResult(
+            adapter_uri=str(terminal["adapter_uri"]),
+            adapter_manifest_uri=str(terminal["adapter_manifest_uri"]),
+            training_report_uri=str(terminal["training_report_uri"]),
+            baseline_predictions_uri=str(terminal["baseline_predictions_uri"]),
+            trained_predictions_uri=str(terminal["trained_predictions_uri"]),
+            publication_manifest_uri=self.artifact_store.uri(key),
+            artifact_checksums=artifact_checksums,
+        )
 
     def publish_experiment(self) -> str:
         key = f"{self.experiment_root}/experiment.json"

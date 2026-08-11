@@ -13,6 +13,8 @@ from cognityx_training.configuration import CustomPyTorchTrainingConfig
 from cognityx_training.factory import create_training_backend
 from cognityx_training.reporting import jsonable_configuration
 
+CLI_RESULT_SCHEMA = "cognityx.training.cli-result/v1"
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse the training configuration path."""
@@ -67,7 +69,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Validate configuration and dataset without loading a model.",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--output-format",
+        choices=("human", "json"),
+        default="human",
+        help="Choose interactive human output or one machine-readable JSON result.",
+    )
+    args = parser.parse_args(argv)
+    if args.output_format == "json" and args.print_config:
+        parser.error("--print-config cannot be combined with --output-format json")
+    return args
 
 
 def resolve_training_config(
@@ -164,19 +175,60 @@ def main(argv: list[str] | None = None) -> None:
         effective_batch_size = (
             config.per_device_train_batch_size * config.gradient_accumulation_steps
         )
-        print(
-            f"Dataset lineage: {json.dumps(asdict(preflight.lineage), sort_keys=True, default=str)}. "
-            f"Dataset records: {preflight.statistics.total_records} total, "
-            f"{preflight.statistics.accepted_training_examples} training, {preflight.statistics.evaluation_records} evaluation. "
-            f"Micro batch: {config.per_device_train_batch_size}; "
-            f"effective batch: {effective_batch_size}; "
-            f"optimizer steps: {config.max_steps}."
-        )
+        if args.output_format == "json":
+            print(
+                json.dumps(
+                    {
+                        "schema": CLI_RESULT_SCHEMA,
+                        "mode": "dry_run",
+                        "experiment_id": config.experiment_id,
+                        "training_run_id": config.training_run_id or config.run_id,
+                        "total_records": preflight.statistics.total_records,
+                        "accepted_training_examples": (
+                            preflight.statistics.accepted_training_examples
+                        ),
+                        "evaluation_records": preflight.statistics.evaluation_records,
+                        "micro_batch_size": config.per_device_train_batch_size,
+                        "effective_batch_size": effective_batch_size,
+                        "optimizer_steps": config.max_steps,
+                        "dataset": {
+                            "dataset_id": preflight.lineage.dataset_id,
+                            "dataset_version": preflight.lineage.dataset_version,
+                            "dataset_manifest_checksum": (
+                                preflight.lineage.dataset_manifest_checksum
+                            ),
+                            "records_checksum": preflight.lineage.records_checksum,
+                            "research_package_id": (
+                                preflight.lineage.research_package_id
+                            ),
+                            "research_package_version": (
+                                preflight.lineage.research_package_version
+                            ),
+                            "research_package_manifest_checksum": (
+                                preflight.lineage.research_package_manifest_checksum
+                            ),
+                        },
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            print(
+                f"Dataset lineage: {json.dumps(asdict(preflight.lineage), sort_keys=True, default=str)}. "
+                f"Dataset records: {preflight.statistics.total_records} total, "
+                f"{preflight.statistics.accepted_training_examples} training, {preflight.statistics.evaluation_records} evaluation. "
+                f"Micro batch: {config.per_device_train_batch_size}; "
+                f"effective batch: {effective_batch_size}; "
+                f"optimizer steps: {config.max_steps}."
+            )
         return
     result = create_training_backend(config).train(TrainingRequest(dataset=dataset))
     report_uri = getattr(result, "report_uri", None) or result.metrics.get("report_uri")
     if os.environ.get("COGNITYX_AUTOTUNE_WORKER") != "1":
         structured = {
+            "schema": CLI_RESULT_SCHEMA,
+            "mode": "completed",
             "experiment_id": result.metrics.get("experiment_id"),
             "training_variant_id": result.metrics.get("training_variant_id"),
             "training_run_id": result.metrics.get("training_run_id"),

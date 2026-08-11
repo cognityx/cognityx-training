@@ -1,10 +1,18 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from cognityx_core import Artifact
 
-from cognityx_training.cli import parse_args, resolve_training_config
-from cognityx_training.custom_pytorch import evaluation_changes
+from cognityx_training.cli import (
+    CLI_RESULT_SCHEMA,
+    main,
+    parse_args,
+    resolve_training_config,
+)
+from cognityx_training.custom_pytorch import _status, evaluation_changes
+from cognityx_training.dataset_pipeline import DatasetLineage, DatasetStatistics
 from cognityx_training.reporting import (
     ResourceMonitor,
     latency_summary,
@@ -43,6 +51,201 @@ def test_cli_accepts_inspection_and_run_overrides() -> None:
     assert args.parent_run_id == "parent-observation-1"
     assert args.print_config is True
     assert args.dry_run is True
+    assert args.output_format == "human"
+
+
+def _cli_config(tmp_path: Path) -> Path:
+    config = tmp_path / "training.toml"
+    config.write_text(
+        "[training]\n"
+        'model_name = ""\n'
+        f'model_cache_dir = "{tmp_path}"\n'
+        f'output_dir = "{tmp_path / "outputs"}"\n'
+        'dataset_input_mode = "legacy_jsonl"\n'
+        "max_steps = 1\n"
+        "per_device_train_batch_size = 1\n"
+        "gradient_accumulation_steps = 1\n"
+        "[experiment]\n"
+        'id = "exp-cli-contract"\n'
+        "[dataset]\n"
+        'name = "safe-fixture"\n'
+        'version = "1"\n'
+        'uri = "fixture.jsonl"\n',
+        encoding="utf-8",
+    )
+    return config
+
+
+def _preflight_result():
+    return SimpleNamespace(
+        lineage=DatasetLineage(
+            dataset_id="dataset-safe",
+            dataset_name="safe-fixture",
+            dataset_version="1",
+            dataset_variant_id="variant-safe",
+            dataset_manifest_uri=None,
+            dataset_manifest_checksum="manifest-checksum",
+            records_uri=None,
+            records_checksum="records-checksum",
+            recipe="fixture",
+            source_manifest_uri=None,
+            source_manifest_checksum="source-checksum",
+            configuration_checksum="config-checksum",
+            research_package_manifest_checksum="package-checksum",
+            research_package_id="package-safe",
+            research_package_version="1",
+        ),
+        statistics=DatasetStatistics(
+            total_records=3,
+            training_records=1,
+            evaluation_records=2,
+            selected_training_candidates=1,
+            accepted_training_examples=1,
+            skipped_overlength_count=0,
+            maximum_observed_token_length=None,
+            maximum_accepted_token_length=None,
+            configured_max_sequence_length=512,
+            split_summary={"train": 1, "evaluation": 2},
+        ),
+    )
+
+
+def test_human_dry_run_output_remains_backward_compatible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        "cognityx_training.dataset_pipeline.preflight_dataset",
+        lambda *args, **kwargs: _preflight_result(),
+    )
+
+    main(["--config", str(_cli_config(tmp_path)), "--dry-run"])
+
+    captured = capsys.readouterr()
+    assert captured.out.startswith("Dataset lineage: ")
+    assert "Dataset records: 3 total, 1 training, 2 evaluation." in captured.out
+
+
+def test_json_dry_run_is_one_directly_parseable_safe_object(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        "cognityx_training.dataset_pipeline.preflight_dataset",
+        lambda *args, **kwargs: _preflight_result(),
+    )
+
+    main(
+        [
+            "--config",
+            str(_cli_config(tmp_path)),
+            "--run-id",
+            "trun-json-dry-run",
+            "--dry-run",
+            "--output-format",
+            "json",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    result = json.loads(captured.out.strip())
+    assert result == {
+        "schema": CLI_RESULT_SCHEMA,
+        "mode": "dry_run",
+        "experiment_id": "exp-cli-contract",
+        "training_run_id": "trun-json-dry-run",
+        "total_records": 3,
+        "accepted_training_examples": 1,
+        "evaluation_records": 2,
+        "micro_batch_size": 1,
+        "effective_batch_size": 1,
+        "optimizer_steps": 1,
+        "dataset": {
+            "dataset_id": "dataset-safe",
+            "dataset_version": "1",
+            "dataset_manifest_checksum": "manifest-checksum",
+            "records_checksum": "records-checksum",
+            "research_package_id": "package-safe",
+            "research_package_version": "1",
+            "research_package_manifest_checksum": "package-checksum",
+        },
+    }
+    assert captured.err == ""
+
+
+def test_json_completed_result_is_one_directly_parseable_object(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    result = SimpleNamespace(
+        artifact=Artifact(
+            name="fixture-adapter",
+            version="1",
+            uri="storage://local-main/models/adapters/adp-safe/1",
+        ),
+        report_uri="storage://local-main/artifacts/runs/trun-safe/report.json",
+        metrics={
+            "experiment_id": "exp-cli-contract",
+            "training_variant_id": "tvar-safe",
+            "training_run_id": "trun-safe",
+            "adapter_id": "adp-safe",
+            "adapter_manifest_uri": (
+                "storage://local-main/models/adapters/adp-safe/1/adapter-manifest.json"
+            ),
+            "publication_manifest_uri": (
+                "storage://local-main/artifacts/runs/trun-safe/publication-manifest.json"
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        "cognityx_training.cli.create_training_backend",
+        lambda config: SimpleNamespace(train=lambda request: result),
+    )
+
+    main(
+        [
+            "--config",
+            str(_cli_config(tmp_path)),
+            "--output-format",
+            "json",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out.strip())
+    assert payload["schema"] == CLI_RESULT_SCHEMA
+    assert payload["mode"] == "completed"
+    for field in (
+        "experiment_id",
+        "training_variant_id",
+        "training_run_id",
+        "adapter_id",
+        "adapter_manifest_uri",
+        "training_report_uri",
+        "publication_manifest_uri",
+        "artifact_uri",
+    ):
+        assert payload[field]
+
+
+def test_training_status_is_written_only_to_stderr(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _status("progress-safe")
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "progress-safe\n"
+
+
+def test_json_output_rejects_ambiguous_print_config() -> None:
+    with pytest.raises(SystemExit) as exc:
+        parse_args(
+            [
+                "--config",
+                "training.toml",
+                "--print-config",
+                "--output-format",
+                "json",
+            ]
+        )
+    assert exc.value.code == 2
 
 
 def _config_values(tmp_path: Path, *, experiment_id: str, seed: int = 11):

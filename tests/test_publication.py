@@ -7,13 +7,16 @@ from types import SimpleNamespace
 
 import pytest
 
+from cognityx_core import Dataset, TrainingRequest
 from cognityx_storage import (
     ObjectAlreadyExistsError,
     ObjectConsistencyError,
     StorageConfig,
     StorageRuntime,
 )
+
 from cognityx_training.configuration import CustomPyTorchTrainingConfig
+from cognityx_training.custom_pytorch import CustomPyTorchTrainerBackend
 from cognityx_training.dataset_pipeline import DatasetLineage
 from cognityx_training.lineage import (
     TrainingLineageIds,
@@ -22,6 +25,7 @@ from cognityx_training.lineage import (
     training_run_id,
 )
 from cognityx_training.publication import (
+    PublicationResult,
     TrainingPublisher,
     bundle_checksum,
     canonical_variant_identity,
@@ -367,6 +371,104 @@ def test_atomic_publication_verifies_and_removes_staging(tmp_path: Path) -> None
     assert adapter_manifest["dataset"]["dataset_variant_id"] == "dvar-clean"
     assert "research_package" not in adapter_manifest
     assert "research_package" not in terminal
+
+
+def test_caller_stable_retry_reuses_verified_terminal_publication(
+    tmp_path: Path,
+) -> None:
+    publisher, identity = _publisher(tmp_path)
+    _prepare(publisher, identity)
+    completed = _complete(publisher, _adapter_staging(tmp_path))
+
+    found = TrainingPublisher.find_completed_run(
+        publisher.storage_runtime,
+        requested_experiment_id="exp-demo",
+        requested_training_run_id="fixture-run",
+    )
+
+    assert found is not None
+    retried_publisher, reused = found
+    assert reused == completed
+    assert retried_publisher.ids == publisher.ids
+    assert reused.adapter_manifest_uri.endswith("/adapter-manifest.json")
+    assert not (tmp_path / "second-adapter-staging").exists()
+
+
+def test_backend_retry_returns_terminal_publication_before_model_allocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publication = PublicationResult(
+        adapter_uri="storage://local-main/models/adapters/adp-existing/1",
+        adapter_manifest_uri=(
+            "storage://local-main/models/adapters/adp-existing/1/adapter-manifest.json"
+        ),
+        training_report_uri=(
+            "storage://local-main/artifacts/runs/trun-fixture-run/training-report.json"
+        ),
+        baseline_predictions_uri=(
+            "storage://local-main/artifacts/runs/trun-fixture-run/baseline.jsonl"
+        ),
+        trained_predictions_uri=(
+            "storage://local-main/artifacts/runs/trun-fixture-run/trained.jsonl"
+        ),
+        publication_manifest_uri=(
+            "storage://local-main/artifacts/runs/trun-fixture-run/publication-manifest.json"
+        ),
+        artifact_checksums={"adapter_bundle": "bundle-safe"},
+    )
+    monkeypatch.setattr(
+        TrainingPublisher,
+        "find_completed_run",
+        lambda *args, **kwargs: (
+            SimpleNamespace(
+                ids=TrainingLineageIds(
+                    experiment_id="exp-demo",
+                    training_variant_id="tvar-existing",
+                    training_run_id="trun-fixture-run",
+                    adapter_id="adp-existing",
+                )
+            ),
+            publication,
+        ),
+    )
+    original_import = __import__
+    monkeypatch.setattr(
+        "builtins.__import__",
+        lambda name, *args, **kwargs: (
+            (_ for _ in ()).throw(
+                AssertionError(
+                    "training libraries must not import during stable-run retry"
+                )
+            )
+            if name in {"torch", "peft", "transformers"}
+            else original_import(name, *args, **kwargs)
+        ),
+    )
+    backend = CustomPyTorchTrainerBackend(
+        _config(
+            tmp_path,
+            experiment_id="exp-demo",
+            training_run_id="fixture-run",
+        ),
+        storage_runtime=_runtime(tmp_path / "retry-storage"),
+    )
+
+    result = backend.train(
+        TrainingRequest(
+            dataset=Dataset(
+                name="fixture",
+                version="1",
+                uri="storage://local-main/datasets/fixture/manifest.json",
+            )
+        )
+    )
+
+    assert result.metrics["reused_completed_publication"] is True
+    assert result.metrics["publication_manifest_uri"] == (
+        publication.publication_manifest_uri
+    )
+    assert result.artifact.uri == publication.adapter_uri
 
 
 def test_research_package_lineage_reaches_adapter_and_terminal(tmp_path: Path) -> None:
