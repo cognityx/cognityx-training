@@ -47,6 +47,13 @@ Reports contain overall metrics and separate `suite_metrics` for roles such as
 `legacy_validation` and `legacy_test`. Prediction rows retain the role and
 evaluation lineage for later forensic evaluation.
 
+For Storage publications, the adapter manifest and the terminal completed-run
+manifest retain the research-package ID, version, URI and checksum and the
+identities of every frozen evaluation set. This trace back to the exact package
+is technically called lineage. It is deliberately separate from the training
+variant ID: changing only a test set does not change the optimizer or the
+resulting adapter.
+
 ## Optional live run index
 
 Training already knows the current optimizer step, loss, processed examples and

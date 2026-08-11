@@ -26,6 +26,13 @@ executables, and progress intervals do not affect the variant ID. Dataset
 checksums, model identity, LoRA settings, sequence length, optimizer settings,
 batching, seed, overlength policy, and source data order do.
 
+A DataForge research package also names frozen evaluation sets. Those test-only
+sets do not enter the optimizer, so their package ID and checksums do not change
+the training variant ID when the training dataset itself is unchanged. Training
+still records the complete package lineage on the adapter and completed run so
+later evaluation can identify the exact tests. A different evaluation package
+is a different evaluation context, not a different trained model.
+
 ## Production configuration
 
 DataForge-backed production training uses Storage publication explicitly:
@@ -98,6 +105,17 @@ adapters/<adapter_id>/1/
 
 All public references are provider-neutral `storage://` URIs.
 
+When the input is a research package, future `cognityx.training.adapter/v1`
+manifests add a `research_package` object. It records the package ID, version,
+manifest URI and checksum, plus each frozen evaluation set's role, ID, version,
+manifest and records checksums, and freeze checksum. Dataset-only publications
+omit this optional object and remain valid.
+
+The terminal `cognityx.training.publication/v1` manifest repeats that package
+lineage and points to the immutable `dataset-lineage.json` artifact with its
+checksum. Downstream tools can therefore resolve the complete provenance from
+Storage without relying on a local training directory or an MLflow run.
+
 ## Atomic success criteria
 
 PEFT output is first written to local staging. Training then rejects unsafe or
@@ -114,6 +132,11 @@ is removed only when `retain_local_staging = false`.
 Use `verify_published_adapter(adapter_manifest_uri, storage_runtime=runtime)` to
 verify a candidate through Storage read streams without loading its base model,
 requiring a native backend path, or allocating a GPU.
+
+The base-model identity names the tokenizer source actually passed to
+Transformers, together with its resolved revision and chat-template checksum.
+This makes the text-to-token rules visible without inventing a separate
+tokenizer reference when Training did not load one.
 
 ## Evaluation handoff
 
