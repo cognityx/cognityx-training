@@ -51,7 +51,7 @@ testpaths = ["tests"]
 [tool.uv.sources]
 cognityx-core = { git = "https://github.com/cognityx/cognityx-core.git" }
 cognityx-inference = { git = "https://github.com/cognityx/cognityx-inference.git" }
-cognityx-observability = { git = "https://github.com/cognityx/cognityx-observability.git", rev = "08b3da3bc3c5defbf24d7e3d0b1142a298e0af7b" }
+cognityx-observability = { git = "https://github.com/cognityx/cognityx-observability.git", rev = "d872acd6b5945c4fd93fc33125edb230a5854b50" }
 cognityx-storage = { git = "https://github.com/cognityx/cognityx-storage.git" }
 
 [build-system]

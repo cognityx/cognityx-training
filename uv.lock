@@ -701,7 +701,7 @@ source = { git = "https://github.com/cognityx/cognityx-jobs.git#c081678b6184b221
 [[package]]
 name = "cognityx-observability"
 version = "0.1.0"
-source = { git = "https://github.com/cognityx/cognityx-observability.git?rev=08b3da3bc3c5defbf24d7e3d0b1142a298e0af7b#08b3da3bc3c5defbf24d7e3d0b1142a298e0af7b" }
+source = { git = "https://github.com/cognityx/cognityx-observability.git?rev=d872acd6b5945c4fd93fc33125edb230a5854b50#d872acd6b5945c4fd93fc33125edb230a5854b50" }
 dependencies = [
     { name = "cognityx-resource" },
 ]
@@ -761,7 +761,7 @@ requires-dist = [
     { name = "bitsandbytes", marker = "extra == 'training'", specifier = ">=0.45" },
     { name = "cognityx-core", git = "https://github.com/cognityx/cognityx-core.git" },
     { name = "cognityx-inference", marker = "python_full_version >= '3.12' and extra == 'evaluation'", git = "https://github.com/cognityx/cognityx-inference.git" },
-    { name = "cognityx-observability", git = "https://github.com/cognityx/cognityx-observability.git?rev=08b3da3bc3c5defbf24d7e3d0b1142a298e0af7b" },
+    { name = "cognityx-observability", git = "https://github.com/cognityx/cognityx-observability.git?rev=d872acd6b5945c4fd93fc33125edb230a5854b50" },
     { name = "cognityx-storage", git = "https://github.com/cognityx/cognityx-storage.git" },
     { name = "datasets", marker = "extra == 'training'", specifier = ">=3.2" },
     { name = "mlflow", marker = "extra == 'tracking'", specifier = ">=2.20" },
