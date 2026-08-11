@@ -12,6 +12,7 @@ from cognityx_core import Dataset, TrainingRequest
 from cognityx_training.configuration import CustomPyTorchTrainingConfig
 from cognityx_training.factory import create_training_backend
 from cognityx_training.reporting import jsonable_configuration
+from cognityx_training.runtime_check import check_training_runtime
 
 CLI_RESULT_SCHEMA = "cognityx.training.cli-result/v1"
 
@@ -64,10 +65,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Print the resolved configuration as JSON.",
     )
-    parser.add_argument(
+    execution_mode = parser.add_mutually_exclusive_group()
+    execution_mode.add_argument(
         "--dry-run",
         action="store_true",
         help="Validate configuration and dataset without loading a model.",
+    )
+    execution_mode.add_argument(
+        "--check-runtime",
+        action="store_true",
+        help="Verify Training execution dependencies and CUDA without loading a model.",
     )
     parser.add_argument(
         "--output-format",
@@ -135,6 +142,19 @@ def main(argv: list[str] | None = None) -> None:
         values = tomllib.load(source)
     dataset_values = values.get("dataset", {})
     config = resolve_training_config(values, args)
+    if args.check_runtime:
+        result = check_training_runtime(require_cuda=config.load_in_4bit)
+        if args.output_format == "json":
+            print(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            outcome = "ready" if result["passed"] else "not ready"
+            print(
+                f"Training runtime is {outcome}: "
+                f"{json.dumps(result, sort_keys=True)}"
+            )
+        if not result["passed"]:
+            raise SystemExit(1)
+        return
     dataset = Dataset(
         name=dataset_values["name"],
         version=str(dataset_values.get("version", "1")),
