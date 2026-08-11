@@ -1,10 +1,10 @@
 """Command-line entry point for configuration-driven training."""
 
 import argparse
-from dataclasses import asdict, replace
 import json
 import os
 import tomllib
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from cognityx_core import Dataset, TrainingRequest
@@ -43,6 +43,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--dataset-input-mode",
         choices=["auto", "dataforge_manifest", "legacy_jsonl"],
         help="Override dataset interpretation mode.",
+    )
+    parser.add_argument(
+        "--dataset-uri",
+        help="Override the configured authoritative DataForge package URI.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        help="Override the configured training seed for an orchestrated run.",
+    )
+    parser.add_argument(
+        "--parent-run-id",
+        help="Attach component tracking to a parent observation run.",
     )
     parser.add_argument(
         "--print-config",
@@ -92,6 +105,8 @@ def main(argv: list[str] | None = None) -> None:
         args.output_dir is not None
         or args.run_id is not None
         or args.experiment_id is not None
+        or args.seed is not None
+        or args.parent_run_id is not None
     ):
         config = replace(
             config,
@@ -99,9 +114,17 @@ def main(argv: list[str] | None = None) -> None:
             run_id=None if args.run_id is not None else config.run_id,
             training_run_id=args.run_id or config.training_run_id,
             experiment_id=args.experiment_id or config.experiment_id,
+            seed=args.seed if args.seed is not None else config.seed,
+            tracking_parent_run_id=(
+                args.parent_run_id or config.tracking_parent_run_id
+            ),
         )
         config.validate()
-    if args.storage_config is not None or args.storage_root is not None or args.dataset_input_mode is not None:
+    if (
+        args.storage_config is not None
+        or args.storage_root is not None
+        or args.dataset_input_mode is not None
+    ):
         config = replace(
             config,
             storage_config=args.storage_config or config.storage_config,
@@ -112,12 +135,15 @@ def main(argv: list[str] | None = None) -> None:
     dataset = Dataset(
         name=dataset_values["name"],
         version=str(dataset_values.get("version", "1")),
-        uri=dataset_values["uri"],
+        uri=args.dataset_uri or dataset_values["uri"],
     )
     if args.print_config:
         print(json.dumps(jsonable_configuration(config), indent=2, sort_keys=True))
     if args.dry_run:
-        from cognityx_training.dataset_pipeline import DataForgeDatasetReader, preflight_dataset
+        from cognityx_training.dataset_pipeline import (
+            DataForgeDatasetReader,
+            preflight_dataset,
+        )
 
         reader = DataForgeDatasetReader(
             dataset.uri,
@@ -165,9 +191,7 @@ def main(argv: list[str] | None = None) -> None:
             "adapter_id": result.metrics.get("adapter_id"),
             "adapter_manifest_uri": result.metrics.get("adapter_manifest_uri"),
             "training_report_uri": report_uri,
-            "publication_manifest_uri": result.metrics.get(
-                "publication_manifest_uri"
-            ),
+            "publication_manifest_uri": result.metrics.get("publication_manifest_uri"),
             "artifact_uri": result.artifact.uri,
         }
         print(json.dumps(structured, indent=2, sort_keys=True))

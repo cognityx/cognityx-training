@@ -21,6 +21,12 @@ def test_cli_accepts_inspection_and_run_overrides() -> None:
             "smoke-run",
             "--experiment-id",
             "exp-smoke",
+            "--dataset-uri",
+            "storage://local-main/datasets/research/package.json",
+            "--seed",
+            "29",
+            "--parent-run-id",
+            "parent-observation-1",
             "--print-config",
             "--dry-run",
         ]
@@ -30,6 +36,9 @@ def test_cli_accepts_inspection_and_run_overrides() -> None:
     assert args.output_dir == Path("outputs")
     assert args.run_id == "smoke-run"
     assert args.experiment_id == "exp-smoke"
+    assert args.dataset_uri == "storage://local-main/datasets/research/package.json"
+    assert args.seed == 29
+    assert args.parent_run_id == "parent-observation-1"
     assert args.print_config is True
     assert args.dry_run is True
 
