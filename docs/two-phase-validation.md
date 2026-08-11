@@ -31,6 +31,21 @@ uv run cognityx-train \
   --print-config --dry-run
 ```
 
+The dry run proves that the configuration and dataset are usable. It does not
+prove that optional execution libraries were installed. Check that boundary
+separately before either validation phase:
+
+```bash
+uv run --extra training cognityx-train \
+  --config examples/qwen3-14b-hello/config.toml \
+  --check-runtime --output-format json
+```
+
+The JSON result lists the Training-owned execution packages, their versions,
+and CUDA visibility. A missing package such as PEFT (the library that attaches
+the small trainable adapter) or a missing CUDA device for four-bit training
+returns a failed result and a non-zero process status, without loading a model.
+
 ## Phase 1: establish the computer limit
 
 Start with the one-example, one-step QLoRA configuration:

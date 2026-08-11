@@ -63,6 +63,20 @@ uv run --extra training cognityx-train \
   --config examples/qwen3-14b-hello/config.toml --print-config --dry-run
 ```
 
+Before a production run, verify that this environment can execute Training,
+not merely import its base package:
+
+```bash
+uv run --extra training cognityx-train \
+  --config examples/qwen3-14b-hello/config.toml \
+  --check-runtime --output-format json
+```
+
+The check imports the packages used by the real LoRA/QLoRA backend and reports
+their versions. For the default four-bit configuration it also requires Torch
+to see a CUDA device. It does not load model weights, create an optimizer,
+train, publish an adapter, or write experiment evidence.
+
 Each execution stores the adapter and `training-report.json` in a unique
 `<output-dir>/<run-id>/` directory. The report includes model, dataset,
 configuration, parameter counts, CPU, RAM, disk I/O, GPU usage, step latency,

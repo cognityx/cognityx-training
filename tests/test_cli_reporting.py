@@ -18,6 +18,7 @@ from cognityx_training.reporting import (
     latency_summary,
     write_training_report,
 )
+from cognityx_training.runtime_check import RUNTIME_CHECK_SCHEMA
 
 
 def test_cli_accepts_inspection_and_run_overrides() -> None:
@@ -246,6 +247,93 @@ def test_json_output_rejects_ambiguous_print_config() -> None:
             ]
         )
     assert exc.value.code == 2
+
+
+def test_runtime_check_is_mutually_exclusive_with_dry_run() -> None:
+    with pytest.raises(SystemExit) as exc:
+        parse_args(
+            [
+                "--config",
+                "training.toml",
+                "--dry-run",
+                "--check-runtime",
+            ]
+        )
+    assert exc.value.code == 2
+
+
+def test_json_runtime_check_is_one_object_and_does_not_read_dataset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    result = {
+        "schema": RUNTIME_CHECK_SCHEMA,
+        "backend": "custom-pytorch",
+        "passed": True,
+        "packages": {"peft": {"status": "available", "version": "1"}},
+        "missing_packages": [],
+        "cuda": {
+            "required": True,
+            "available": True,
+            "device_count": 1,
+            "error_type": None,
+        },
+    }
+    monkeypatch.setattr(
+        "cognityx_training.cli.check_training_runtime", lambda **kwargs: result
+    )
+    monkeypatch.setattr(
+        "cognityx_training.cli.Dataset",
+        lambda **kwargs: pytest.fail("runtime check must not construct a dataset"),
+    )
+
+    main(
+        [
+            "--config",
+            str(_cli_config(tmp_path)),
+            "--check-runtime",
+            "--output-format",
+            "json",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == result
+    assert captured.err == ""
+
+
+def test_failed_runtime_check_exits_nonzero_after_machine_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    result = {
+        "schema": RUNTIME_CHECK_SCHEMA,
+        "backend": "custom-pytorch",
+        "passed": False,
+        "packages": {"peft": {"status": "unavailable", "version": None}},
+        "missing_packages": ["peft"],
+        "cuda": {
+            "required": True,
+            "available": True,
+            "device_count": 1,
+            "error_type": None,
+        },
+    }
+    monkeypatch.setattr(
+        "cognityx_training.cli.check_training_runtime", lambda **kwargs: result
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "--config",
+                str(_cli_config(tmp_path)),
+                "--check-runtime",
+                "--output-format",
+                "json",
+            ]
+        )
+
+    assert exc.value.code == 1
+    assert json.loads(capsys.readouterr().out)["missing_packages"] == ["peft"]
 
 
 def _config_values(tmp_path: Path, *, experiment_id: str, seed: int = 11):
