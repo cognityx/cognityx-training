@@ -3,9 +3,14 @@
 import argparse
 import json
 import os
+import sys
 import tomllib
-from dataclasses import asdict
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass
+from hashlib import sha256
 from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from cognityx_core import Dataset, TrainingRequest
 
@@ -19,6 +24,21 @@ CLI_RESULT_SCHEMA = "cognityx.training.cli-result/v1"
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse the training configuration path."""
+    arguments = list(argv) if argv is not None else list(sys.argv[1:])
+    if arguments and arguments[0] == "config":
+        parser = argparse.ArgumentParser(description="Inspect a Training run specification.")
+        commands = parser.add_subparsers(dest="command", required=True)
+        config = commands.add_parser("config")
+        actions = config.add_subparsers(dest="config_action", required=True)
+        for name in ("show", "validate"):
+            selected = actions.add_parser(name)
+            _add_inspection_arguments(selected)
+        args = parser.parse_args(arguments)
+        args.print_config = False
+        args.dry_run = False
+        args.check_runtime = False
+        args.output_format = "json"
+        return args
     parser = argparse.ArgumentParser(description="Run a Cognityx training backend.")
     parser.add_argument(
         "--config", type=Path, required=True, help="TOML training configuration."
@@ -82,14 +102,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="human",
         help="Choose interactive human output or one machine-readable JSON result.",
     )
-    args = parser.parse_args(argv)
+    args = parser.parse_args(arguments)
+    args.command = "run"
     if args.output_format == "json" and args.print_config:
         parser.error("--print-config cannot be combined with --output-format json")
     return args
 
 
+def _add_inspection_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--run-id")
+    parser.add_argument("--experiment-id")
+    parser.add_argument("--storage-config", type=Path)
+    parser.add_argument("--storage-root")
+    parser.add_argument(
+        "--dataset-input-mode",
+        choices=["auto", "dataforge_manifest", "legacy_jsonl"],
+    )
+    parser.add_argument("--dataset-uri")
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--parent-run-id")
+
+
 def resolve_training_config(
-    values: dict[str, object], args: argparse.Namespace
+    values: Mapping[str, Any], args: argparse.Namespace
 ) -> CustomPyTorchTrainingConfig:
     """Compose TOML values and CLI overrides before validating once."""
     training = dict(values.get("training") or {})
@@ -135,24 +172,216 @@ def resolve_training_config(
     return CustomPyTorchTrainingConfig.from_mapping(effective)
 
 
+@dataclass(frozen=True, slots=True)
+class TrainingConfigResolution:
+    configuration: CustomPyTorchTrainingConfig
+    values: Mapping[str, Any]
+    path: Path
+    file_sha256: str
+    field_sources: Mapping[str, str]
+    overrides: tuple[Mapping[str, Any], ...]
+    dataset_uri: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        effective = _secret_safe(jsonable_configuration(self.configuration))
+        effective["dataset_uri"] = self.dataset_uri
+        return {
+            "component": "training",
+            "configuration_kind": "scientific-workload",
+            "valid": True,
+            "master_config": {
+                "kind": "file",
+                "path": str(self.path),
+                "selected_by": "explicit",
+                "sha256": self.file_sha256,
+            },
+            "config_layers": [{
+                "path": str(self.path),
+                "selected_by": "explicit",
+                "sha256": self.file_sha256,
+                "changed_keys": sorted(
+                    key for key, source in self.field_sources.items() if source == str(self.path)
+                ),
+            }],
+            "field_sources": dict(sorted(self.field_sources.items())),
+            "overrides": [dict(item) for item in self.overrides],
+            "effective": effective,
+            "warnings": [],
+            "errors": [],
+        }
+
+
+def resolve_training_configuration(
+    path: str | Path, args: argparse.Namespace
+) -> TrainingConfigResolution:
+    selected = Path(path).expanduser().resolve()
+    raw = selected.read_bytes()
+    values = tomllib.loads(raw.decode("utf-8"))
+    baseline_args = argparse.Namespace(**vars(args))
+    override_flags = {
+        "output_dir": "--output-dir",
+        "run_id": "--run-id",
+        "experiment_id": "--experiment-id",
+        "storage_config": "--storage-config",
+        "storage_root": "--storage-root",
+        "dataset_input_mode": "--dataset-input-mode",
+        "seed": "--seed",
+        "parent_run_id": "--parent-run-id",
+    }
+    for name in override_flags:
+        setattr(baseline_args, name, None)
+    baseline = resolve_training_config(values, baseline_args)
+    configuration = resolve_training_config(values, args)
+    baseline_values = jsonable_configuration(baseline)
+    effective_values = jsonable_configuration(configuration)
+    overrides: list[Mapping[str, Any]] = []
+    overridden_fields: dict[str, str] = {}
+    for name, flag in override_flags.items():
+        supplied = getattr(args, name, None)
+        if supplied is None:
+            continue
+        target = "tracking_parent_run_id" if name == "parent_run_id" else (
+            "training_run_id" if name == "run_id" else name
+        )
+        previous = baseline_values.get(target)
+        effective = effective_values.get(target)
+        if previous != effective:
+            overrides.append({
+                "key": target,
+                "source": flag,
+                "previous": _secret_safe(previous, target),
+                "effective": _secret_safe(effective, target),
+                "changed": True,
+            })
+            overridden_fields[target] = flag
+    dataset_values = dict(values.get("dataset") or {})
+    baseline_dataset_uri = dataset_values.get("uri")
+    dataset_uri = getattr(args, "dataset_uri", None) or baseline_dataset_uri
+    if getattr(args, "dataset_uri", None) is not None and dataset_uri != baseline_dataset_uri:
+        overrides.append({
+            "key": "dataset_uri",
+            "source": "--dataset-uri",
+            "previous": _secret_safe(baseline_dataset_uri, "dataset_uri"),
+            "effective": _secret_safe(dataset_uri, "dataset_uri"),
+            "changed": True,
+        })
+        overridden_fields["dataset_uri"] = "--dataset-uri"
+    file_fields = set(dict(values.get("training") or {}))
+    file_fields.update({
+        {"id": "experiment_id", "name": "experiment_name", "description": "experiment_description", "created_by": "experiment_created_by", "tags": "experiment_tags"}[name]
+        for name in dict(values.get("experiment") or {})
+        if name in {"id", "name", "description", "created_by", "tags"}
+    })
+    file_fields.update({
+        {"mode": "publication_mode", "retain_local_staging": "retain_local_staging"}[name]
+        for name in dict(values.get("publication") or {})
+        if name in {"mode", "retain_local_staging"}
+    })
+    file_fields.update({
+        {"backend": "tracking_backend", "uri": "tracking_uri", "experiment_name": "tracking_experiment_name", "run_name": "tracking_run_name", "parent_run_id": "tracking_parent_run_id", "failure_policy": "tracking_failure_policy"}[name]
+        for name in dict(values.get("tracking") or {})
+        if name in {"backend", "uri", "experiment_name", "run_name", "parent_run_id", "failure_policy"}
+    })
+    field_sources = {
+        name: overridden_fields.get(name, str(selected) if name in file_fields else "built-in")
+        for name in effective_values
+    }
+    field_sources["dataset_uri"] = overridden_fields.get(
+        "dataset_uri", str(selected) if "uri" in dataset_values else "built-in"
+    )
+    return TrainingConfigResolution(
+        configuration=configuration,
+        values=values,
+        path=selected,
+        file_sha256=sha256(raw).hexdigest(),
+        field_sources=field_sources,
+        overrides=tuple(overrides),
+        dataset_uri=str(dataset_uri) if dataset_uri is not None else None,
+    )
+
+
+def _secret_safe(value: Any, key: str = "") -> Any:
+    lowered = key.lower()
+    if any(marker in lowered for marker in ("secret", "password", "token", "api_key")):
+        return "<redacted>" if value is not None else None
+    if isinstance(value, dict):
+        return {str(name): _secret_safe(item, str(name)) for name, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_secret_safe(item, key) for item in value]
+    if isinstance(value, str) and "://" in value:
+        return _redacted_uri(value)
+    return value
+
+
+def _redacted_uri(value: str) -> str:
+    parsed = urlsplit(value)
+    host = parsed.hostname or ""
+    if parsed.port is not None:
+        host = f"{host}:{parsed.port}"
+    netloc = (
+        host
+        if parsed.username is not None or parsed.password is not None
+        else parsed.netloc
+    )
+    query = urlencode([
+        (
+            name,
+            "<redacted>"
+            if any(
+                marker in name.lower()
+                for marker in ("secret", "password", "token", "api_key")
+            )
+            else item,
+        )
+        for name, item in parse_qsl(parsed.query, keep_blank_values=True)
+    ])
+    return urlunsplit((parsed.scheme, netloc, parsed.path, query, parsed.fragment))
+
+
 def main(argv: list[str] | None = None) -> None:
     """Load TOML configuration and run the selected backend."""
     args = parse_args(argv)
-    with args.config.open("rb") as source:
-        values = tomllib.load(source)
+    try:
+        resolution = resolve_training_configuration(args.config, args)
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError) as exc:
+        if args.command == "config":
+            report = {
+                "component": "training",
+                "configuration_kind": "scientific-workload",
+                "valid": False,
+                "master_config": {
+                    "kind": "file",
+                    "path": str(args.config.expanduser().resolve()),
+                    "selected_by": "explicit",
+                    "sha256": None,
+                },
+                "config_layers": [],
+                "field_sources": {},
+                "overrides": [],
+                "effective": {},
+                "warnings": [],
+                "errors": [{"code": "configuration_invalid", "message": str(exc)}],
+            }
+            print(json.dumps(report, indent=2, sort_keys=True))
+            raise SystemExit(2) from None
+        raise
+    if args.command == "config":
+        print(json.dumps(resolution.to_dict(), indent=2, sort_keys=True))
+        return
+    values = resolution.values
     dataset_values = values.get("dataset", {})
-    config = resolve_training_config(values, args)
+    config = resolution.configuration
     if args.check_runtime:
-        result = check_training_runtime(require_cuda=config.load_in_4bit)
+        runtime_result = check_training_runtime(require_cuda=config.load_in_4bit)
         if args.output_format == "json":
-            print(json.dumps(result, indent=2, sort_keys=True))
+            print(json.dumps(runtime_result, indent=2, sort_keys=True))
         else:
-            outcome = "ready" if result["passed"] else "not ready"
+            outcome = "ready" if runtime_result["passed"] else "not ready"
             print(
                 f"Training runtime is {outcome}: "
-                f"{json.dumps(result, sort_keys=True)}"
+                f"{json.dumps(runtime_result, sort_keys=True)}"
             )
-        if not result["passed"]:
+        if not runtime_result["passed"]:
             raise SystemExit(1)
         return
     dataset = Dataset(

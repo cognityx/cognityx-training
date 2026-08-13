@@ -1,4 +1,5 @@
 import json
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +11,7 @@ from cognityx_training.cli import (
     main,
     parse_args,
     resolve_training_config,
+    resolve_training_configuration,
 )
 from cognityx_training.custom_pytorch import _status, evaluation_changes
 from cognityx_training.dataset_pipeline import DatasetLineage, DatasetStatistics
@@ -55,6 +57,46 @@ def test_cli_accepts_inspection_and_run_overrides() -> None:
     assert args.output_format == "human"
 
 
+def test_static_config_command_is_side_effect_free_and_reports_actual_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    config = _cli_config(tmp_path)
+    monkeypatch.setattr(
+        "cognityx_training.cli.Dataset",
+        lambda *_args, **_kwargs: pytest.fail("dataset was constructed"),
+    )
+    monkeypatch.setattr(
+        "cognityx_training.cli.create_training_backend",
+        lambda *_args, **_kwargs: pytest.fail("backend was constructed"),
+    )
+
+    main([
+        "config", "show", "--config", str(config),
+        "--seed", "29", "--output-dir", str(tmp_path / "override"),
+    ])
+    shown = json.loads(capsys.readouterr().out)
+
+    assert shown["configuration_kind"] == "scientific-workload"
+    assert {item["source"] for item in shown["overrides"]} == {"--seed", "--output-dir"}
+    assert shown["master_config"]["sha256"] == __import__("hashlib").sha256(
+        config.read_bytes()
+    ).hexdigest()
+    output = json.dumps(shown)
+    assert "user:password" not in output
+    assert "never-show" not in output
+    parsed = parse_args(["config", "validate", "--config", str(config)])
+    assert resolve_training_configuration(config, parsed).configuration == resolve_training_config(
+        tomllib.loads(config.read_text(encoding="utf-8")), parsed
+    )
+
+
+def test_static_config_missing_file_returns_nonzero_json(tmp_path: Path, capsys) -> None:
+    with pytest.raises(SystemExit) as raised:
+        main(["config", "validate", "--config", str(tmp_path / "missing.toml")])
+    assert raised.value.code == 2
+    assert json.loads(capsys.readouterr().out)["valid"] is False
+
+
 def _cli_config(tmp_path: Path) -> Path:
     config = tmp_path / "training.toml"
     config.write_text(
@@ -71,7 +113,9 @@ def _cli_config(tmp_path: Path) -> Path:
         "[dataset]\n"
         'name = "safe-fixture"\n'
         'version = "1"\n'
-        'uri = "fixture.jsonl"\n',
+        'uri = "fixture.jsonl"\n'
+        '[tracking]\n'
+        'uri = "https://user:password@example.test/path?access_token=never-show"\n',
         encoding="utf-8",
     )
     return config
