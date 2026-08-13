@@ -16,6 +16,7 @@ from cognityx_core import Dataset, TrainingRequest
 
 from cognityx_training.configuration import CustomPyTorchTrainingConfig
 from cognityx_training.factory import create_training_backend
+from cognityx_training.human import render_human
 from cognityx_training.reporting import jsonable_configuration
 from cognityx_training.runtime_check import check_training_runtime
 
@@ -26,7 +27,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse the training configuration path."""
     arguments = list(argv) if argv is not None else list(sys.argv[1:])
     if arguments and arguments[0] == "config":
-        parser = argparse.ArgumentParser(description="Inspect a Training run specification.")
+        parser = argparse.ArgumentParser(
+            description="Inspect a Training run specification."
+        )
         commands = parser.add_subparsers(dest="command", required=True)
         config = commands.add_parser("config")
         actions = config.add_subparsers(dest="config_action", required=True)
@@ -96,11 +99,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Verify Training execution dependencies and CUDA without loading a model.",
     )
-    parser.add_argument(
+    presentation = parser.add_mutually_exclusive_group()
+    presentation.add_argument(
         "--output-format",
         choices=("human", "json"),
         default="human",
         help="Choose interactive human output or one machine-readable JSON result.",
+    )
+    presentation.add_argument(
+        "--human",
+        dest="output_format",
+        action="store_const",
+        const="human",
+        help="Explicit alias for --output-format human.",
     )
     args = parser.parse_args(arguments)
     args.command = "run"
@@ -123,6 +134,7 @@ def _add_inspection_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dataset-uri")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--parent-run-id")
+    parser.add_argument("--human", action="store_true")
 
 
 def resolve_training_config(
@@ -195,14 +207,18 @@ class TrainingConfigResolution:
                 "selected_by": "explicit",
                 "sha256": self.file_sha256,
             },
-            "config_layers": [{
-                "path": str(self.path),
-                "selected_by": "explicit",
-                "sha256": self.file_sha256,
-                "changed_keys": sorted(
-                    key for key, source in self.field_sources.items() if source == str(self.path)
-                ),
-            }],
+            "config_layers": [
+                {
+                    "path": str(self.path),
+                    "selected_by": "explicit",
+                    "sha256": self.file_sha256,
+                    "changed_keys": sorted(
+                        key
+                        for key, source in self.field_sources.items()
+                        if source == str(self.path)
+                    ),
+                }
+            ],
             "field_sources": dict(sorted(self.field_sources.items())),
             "overrides": [dict(item) for item in self.overrides],
             "effective": effective,
@@ -240,50 +256,91 @@ def resolve_training_configuration(
         supplied = getattr(args, name, None)
         if supplied is None:
             continue
-        target = "tracking_parent_run_id" if name == "parent_run_id" else (
-            "training_run_id" if name == "run_id" else name
+        target = (
+            "tracking_parent_run_id"
+            if name == "parent_run_id"
+            else ("training_run_id" if name == "run_id" else name)
         )
         previous = baseline_values.get(target)
         effective = effective_values.get(target)
         if previous != effective:
-            overrides.append({
-                "key": target,
-                "source": flag,
-                "previous": _secret_safe(previous, target),
-                "effective": _secret_safe(effective, target),
-                "changed": True,
-            })
+            overrides.append(
+                {
+                    "key": target,
+                    "source": flag,
+                    "previous": _secret_safe(previous, target),
+                    "effective": _secret_safe(effective, target),
+                    "changed": True,
+                }
+            )
             overridden_fields[target] = flag
     dataset_values = dict(values.get("dataset") or {})
     baseline_dataset_uri = dataset_values.get("uri")
     dataset_uri = getattr(args, "dataset_uri", None) or baseline_dataset_uri
-    if getattr(args, "dataset_uri", None) is not None and dataset_uri != baseline_dataset_uri:
-        overrides.append({
-            "key": "dataset_uri",
-            "source": "--dataset-uri",
-            "previous": _secret_safe(baseline_dataset_uri, "dataset_uri"),
-            "effective": _secret_safe(dataset_uri, "dataset_uri"),
-            "changed": True,
-        })
+    if (
+        getattr(args, "dataset_uri", None) is not None
+        and dataset_uri != baseline_dataset_uri
+    ):
+        overrides.append(
+            {
+                "key": "dataset_uri",
+                "source": "--dataset-uri",
+                "previous": _secret_safe(baseline_dataset_uri, "dataset_uri"),
+                "effective": _secret_safe(dataset_uri, "dataset_uri"),
+                "changed": True,
+            }
+        )
         overridden_fields["dataset_uri"] = "--dataset-uri"
     file_fields = set(dict(values.get("training") or {}))
-    file_fields.update({
-        {"id": "experiment_id", "name": "experiment_name", "description": "experiment_description", "created_by": "experiment_created_by", "tags": "experiment_tags"}[name]
-        for name in dict(values.get("experiment") or {})
-        if name in {"id", "name", "description", "created_by", "tags"}
-    })
-    file_fields.update({
-        {"mode": "publication_mode", "retain_local_staging": "retain_local_staging"}[name]
-        for name in dict(values.get("publication") or {})
-        if name in {"mode", "retain_local_staging"}
-    })
-    file_fields.update({
-        {"backend": "tracking_backend", "uri": "tracking_uri", "experiment_name": "tracking_experiment_name", "run_name": "tracking_run_name", "parent_run_id": "tracking_parent_run_id", "failure_policy": "tracking_failure_policy"}[name]
-        for name in dict(values.get("tracking") or {})
-        if name in {"backend", "uri", "experiment_name", "run_name", "parent_run_id", "failure_policy"}
-    })
+    file_fields.update(
+        {
+            {
+                "id": "experiment_id",
+                "name": "experiment_name",
+                "description": "experiment_description",
+                "created_by": "experiment_created_by",
+                "tags": "experiment_tags",
+            }[name]
+            for name in dict(values.get("experiment") or {})
+            if name in {"id", "name", "description", "created_by", "tags"}
+        }
+    )
+    file_fields.update(
+        {
+            {
+                "mode": "publication_mode",
+                "retain_local_staging": "retain_local_staging",
+            }[name]
+            for name in dict(values.get("publication") or {})
+            if name in {"mode", "retain_local_staging"}
+        }
+    )
+    file_fields.update(
+        {
+            {
+                "backend": "tracking_backend",
+                "uri": "tracking_uri",
+                "experiment_name": "tracking_experiment_name",
+                "run_name": "tracking_run_name",
+                "parent_run_id": "tracking_parent_run_id",
+                "failure_policy": "tracking_failure_policy",
+            }[name]
+            for name in dict(values.get("tracking") or {})
+            if name
+            in {
+                "backend",
+                "uri",
+                "experiment_name",
+                "run_name",
+                "parent_run_id",
+                "failure_policy",
+            }
+        }
+    )
     field_sources = {
-        name: overridden_fields.get(name, str(selected) if name in file_fields else "built-in")
+        name: overridden_fields.get(
+            name, str(selected) if name in file_fields else "built-in"
+        )
         for name in effective_values
     }
     field_sources["dataset_uri"] = overridden_fields.get(
@@ -305,7 +362,9 @@ def _secret_safe(value: Any, key: str = "") -> Any:
     if any(marker in lowered for marker in ("secret", "password", "token", "api_key")):
         return "<redacted>" if value is not None else None
     if isinstance(value, dict):
-        return {str(name): _secret_safe(item, str(name)) for name, item in value.items()}
+        return {
+            str(name): _secret_safe(item, str(name)) for name, item in value.items()
+        }
     if isinstance(value, (list, tuple)):
         return [_secret_safe(item, key) for item in value]
     if isinstance(value, str) and "://" in value:
@@ -323,18 +382,20 @@ def _redacted_uri(value: str) -> str:
         if parsed.username is not None or parsed.password is not None
         else parsed.netloc
     )
-    query = urlencode([
-        (
-            name,
-            "<redacted>"
-            if any(
-                marker in name.lower()
-                for marker in ("secret", "password", "token", "api_key")
+    query = urlencode(
+        [
+            (
+                name,
+                "<redacted>"
+                if any(
+                    marker in name.lower()
+                    for marker in ("secret", "password", "token", "api_key")
+                )
+                else item,
             )
-            else item,
-        )
-        for name, item in parse_qsl(parsed.query, keep_blank_values=True)
-    ])
+            for name, item in parse_qsl(parsed.query, keep_blank_values=True)
+        ]
+    )
     return urlunsplit((parsed.scheme, netloc, parsed.path, query, parsed.fragment))
 
 
@@ -362,11 +423,11 @@ def main(argv: list[str] | None = None) -> None:
                 "warnings": [],
                 "errors": [{"code": "configuration_invalid", "message": str(exc)}],
             }
-            print(json.dumps(report, indent=2, sort_keys=True))
+            _write(report, human=args.human)
             raise SystemExit(2) from None
         raise
     if args.command == "config":
-        print(json.dumps(resolution.to_dict(), indent=2, sort_keys=True))
+        _write(resolution.to_dict(), human=args.human)
         return
     values = resolution.values
     dataset_values = values.get("dataset", {})
@@ -488,6 +549,13 @@ def main(argv: list[str] | None = None) -> None:
             "artifact_uri": result.artifact.uri,
         }
         print(json.dumps(structured, indent=2, sort_keys=True))
+
+
+def _write(value: Any, *, human: bool) -> None:
+    if human:
+        print(render_human(value))
+    else:
+        print(json.dumps(value, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

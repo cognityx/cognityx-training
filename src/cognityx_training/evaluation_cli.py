@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 import tomllib
+from pathlib import Path
 
 from cognityx_training.evaluation_configuration import EvaluationConfig
 from cognityx_training.evaluation_pipeline import EvaluationPipeline, show_evaluation
+from cognityx_training.human import render_human
 from cognityx_training.storage_runtime import resolve_storage_runtime
 
 
@@ -25,6 +26,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             required=True,
             help="TOML evaluation configuration.",
         )
+        selected.add_argument("--human", action="store_true")
     resume = subparsers.add_parser("resume")
     resume.add_argument("--evaluation-request", required=True)
     show = subparsers.add_parser("show")
@@ -32,6 +34,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     for selected in (resume, show):
         selected.add_argument("--storage-config", type=Path)
         selected.add_argument("--storage-root")
+        selected.add_argument("--human", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -60,7 +63,10 @@ def main(argv: list[str] | None = None) -> None:
                 args.evaluation_manifest,
                 storage_runtime=runtime,
             )
-    print(json.dumps(result, indent=2, sort_keys=True))
+    if args.human:
+        print(render_human(result))
+    else:
+        print(json.dumps(result, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":
