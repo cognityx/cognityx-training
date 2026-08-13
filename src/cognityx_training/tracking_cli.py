@@ -5,8 +5,13 @@ from __future__ import annotations
 import argparse
 import json
 
+from cognityx_training.human import render_human
 from cognityx_training.storage_runtime import resolve_storage_runtime
-from cognityx_training.tracking import create_tracker, payload_from_publication, track_with_policy
+from cognityx_training.tracking import (
+    create_tracker,
+    payload_from_publication,
+    track_with_policy,
+)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -20,8 +25,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--failure-policy", choices=("warn", "error"), default="warn")
     parser.add_argument("--storage-config")
     parser.add_argument("--storage-root")
+    parser.add_argument("--human", action="store_true")
     args = parser.parse_args(argv)
-    runtime = resolve_storage_runtime(storage_config=args.storage_config, storage_root=args.storage_root)
+    runtime = resolve_storage_runtime(
+        storage_config=args.storage_config, storage_root=args.storage_root
+    )
     payload = payload_from_publication(runtime, args.publication_manifest_uri)
     tracker = create_tracker(
         backend=args.backend,
@@ -31,8 +39,12 @@ def main(argv: list[str] | None = None) -> None:
         parent_run_id=args.parent_run_id,
     )
     result = track_with_policy(tracker, payload, failure_policy=args.failure_policy)
-    print(json.dumps({
+    output = {
         "status": result.status,
         "backend": result.backend,
         "external_run_id": result.external_run_id,
-    }, indent=2, sort_keys=True))
+    }
+    if args.human:
+        print(render_human(output))
+    else:
+        print(json.dumps(output, indent=2, sort_keys=True))

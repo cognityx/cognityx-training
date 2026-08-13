@@ -176,6 +176,10 @@ Training publication does not promote, deploy, serve, or release the adapter.
 
 ## Local compatibility mode
 
+`cognityx-track-publication` prints JSON by default. Add `--human` for a labelled
+view of its single final tracking result. The flag does not repeat Storage reads
+or tracker writes.
+
 Legacy hello-world, private-fact, and autotune configurations declare:
 
 ```toml

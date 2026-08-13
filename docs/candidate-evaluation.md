@@ -31,6 +31,10 @@ continues to support the repository's broader Python requirement.
 Start from `examples/evaluation/config.toml`. Candidate identities must be
 completed `storage://` publication manifests. Local paths are not accepted.
 
+Finite `cognityx-evaluate plan`, `run`, `resume`, and `show` results retain JSON
+as their default. Add `--human` to render the same completed payload as labelled
+sections without repeating the evaluation operation.
+
 The judge can be local or provider-backed. Local lifecycle configuration may
 start a named Inference server profile. The evaluator records whether the judge
 was already resident or was loaded by this evaluation. It unloads only a model
